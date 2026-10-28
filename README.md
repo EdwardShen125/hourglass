@@ -16,22 +16,37 @@ instead:
   cancelable, and recoverable in SQL you can query.
 - The time wheel keeps the precision: each scheduling node runs a
   hierarchical timing wheel that fires admitted triggers at second-level
-  accuracy, with no broker in the hot path. Timing is a pluggable
-  contract (`TimingEngine`); a broker `deliver-at` engine can serve
-  deployments that already run Pulsar or Kafka.
+  accuracy, with no broker in the hot path.
 - Coordination keeps the scale: nodes lease partitions of the trigger
   table through etcd; ownership handoff is epoch-fenced, and a new owner
   reclaims missed work by rescanning its misfire horizon.
 
-Delivery is decoupled from timing the same way. A `fired_record` row is
-the durable delivery queue: per-domain in-process queues are only a fast
-path, a reaper re-delivers anything the fast path dropped, and a dead
-letter is a queryable table row, not a lost topic.
+What happens to an admitted trigger is itself a pluggable contract
+(`CommandSink`), symmetric with the storage driver:
+
+- `wheel` (built-in): the node holds the admitted slice in its time
+  wheel and delivers through the built-in engine — a `fired_record` row
+  is the durable delivery queue, per-domain in-process queues are only a
+  fast path, a reaper re-delivers anything the fast path dropped, and a
+  dead letter is a queryable table row, not a lost topic. Cancellation
+  is strong: a trigger can be canceled any time before it fires, and
+  epoch fencing stops a zombie node's late shots.
+- `delayed-queue` (drivers: Pulsar, RocketMQ 5.x): admission publishes
+  with `deliver-at` and the broker holds the admitted slice — for
+  deployments that already run one. Cancellation stops at admission;
+  that is the broker's contract, not hidden.
+
+Backends can be mixed per domain: point one domain at an existing
+Pulsar cluster while another runs broker-free. Kafka is a non-goal for
+this driver — it has no native delayed delivery, and a two-topic
+workaround would rebuild the wheel against the wrong system.
 
 ## Contracts
 
-- Admission is the cancellation boundary. No command can be canceled
-  after admission; cancel before the CAS wins.
+- Admission is the cancellation boundary for delayed-queue domains. No
+  command can be canceled after admission; cancel before the CAS wins.
+  Wheel domains cancel until the fire moment; the cancel API reports
+  which happened.
 - At-least-once delivery, idempotent executors. A node can die between
   admission and delivery; the next owner re-fires within the misfire
   horizon.
@@ -45,12 +60,13 @@ letter is a queryable table row, not a lost topic.
 Design phase. v0.1 scope:
 
 - [ ] Storage driver interface + MySQL/TiDB driver (partitioned scans)
-- [ ] TimingEngine interface + hierarchical time wheel driver
-- [ ] DeliveryEngine: fired-record state machine, per-domain in-memory
-      queues, reaper, gRPC push, SQL dead letters
+- [ ] CommandSink interface + built-in wheel sink: hierarchical wheel,
+      fired-record state machine, per-domain queues, reaper, gRPC push,
+      SQL dead letters
 - [ ] etcd shard registry: lease, watch, epoch-fenced handoff
 - [ ] CAS admission loop with misfire rescan
 - [ ] Executor SDK (gRPC): registration, heartbeat, idempotency
+- [ ] delayed-queue drivers (Pulsar, RocketMQ 5.x) — after v0.1, on demand
 
 The design is a clean-room rebuild of a production system that peaked
 above 200K execution commands per second; its architecture and failure
