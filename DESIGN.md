@@ -99,6 +99,9 @@ make handoff drain one wheel, not surgery on a shared one).
 - The fire path validates the shard epoch **per batch, before firing**:
   a zombie node whose ownership was revoked must not deliver. This is
   load-bearing correctness machinery, not an optimization.
+- Cancel of an admitted-but-unfired job is **mark, don't remove**:
+  flag the entry, let the fire tick skip it. Removal races the tick;
+  a mark is O(1) and a late mark is a no-op.
 
 ### Dispersion (jitter) windows
 
@@ -133,12 +136,18 @@ The `fired_record` row is the durable queue; memory is a cache.
   one slow domain cannot stall shared partitions.
 - Executors register in etcd with lease TTL; routing is
   least-outstanding per domain.
-- Retry with exponential backoff, bounded; then `state=dead`. Dead
-  letters are rows: `hourglass dlq ls`, `hourglass dlq replay`.
+- Retry with exponential backoff capped by **both** max attempts and
+  max age, whichever comes first — a capped-backoff zombie must not
+  retry forever; then `state=dead`. Dead letters are rows:
+  `hourglass dlq ls`, `hourglass dlq replay`.
 
 ### Shard registry (cluster mode)
 
-- Each scheduling node holds an etcd lease and claims partitions.
+- Each scheduling node holds an etcd lease and claims partitions —
+  **logical shards**, over-allocated and mapped onto physical
+  partitions by a directory. Growing capacity edits the mapping
+  instead of re-splitting partitions; Temporal's permanently fixed
+  shard count is the cautionary tale.
 - Ownership records carry a monotonically increasing **epoch**.
 - Handoff, graceful: stop admitting, drain the wheel (fire what is due
   or requeue what is not), release.
@@ -160,6 +169,19 @@ Job:
 
 fired_record (cluster): delivering -> delivered | dead; dead ->
 delivering (replay).
+
+## Retention and growth
+
+Terminal rows accumulate forever otherwise — the documented pain of
+every SQL-truth scheduler (river tells users to archive; an embedded
+SQLite file grows silently into gigabytes).
+
+- Terminal rows (`completed`, `dead`) expire on a configurable TTL
+  (default 7 days); a background purge loop deletes them in bounded
+  batches, never inline with the fire path.
+- Purge reports store-size metrics. SQLite runs with auto_vacuum;
+  MySQL/TiDB partitions that are fully terminal can be dropped
+  wholesale.
 
 ## The four load-bearing pieces
 
@@ -245,3 +267,13 @@ its failure model.
 | --- | --- | --- | --- | --- |
 | embedded | SQLite | none | in-process workers | apps, ≤ thousands of jobs/s |
 | cluster | MySQL/TiDB | etcd | DeliveryEngine + gRPC executors | platforms, hot storms, HA |
+
+## Implementation notes (deferred, recorded)
+
+- Fire-path state advances in **batched** writes (UPDATE by id set),
+  symmetric with batched CAS admission — per-job writes turn the hot
+  minute into a write storm.
+- The executor ack protocol reserves an optional `reschedule_at`
+  field from day one (executor self-chaining: drip patterns,
+  executor-driven retries); adding a field later costs a protocol
+  migration, reserving it costs nothing.
