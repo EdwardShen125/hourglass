@@ -100,6 +100,16 @@ make handoff drain one wheel, not surgery on a shared one).
   a zombie node whose ownership was revoked must not deliver. This is
   load-bearing correctness machinery, not an optimization.
 
+### Dispersion (jitter) windows
+
+Hot minutes can be melted before they form. A schedule may carry a
+`jitter` window; its due time is `scheduled + rand(0, jitter)`, drawn
+once at submit and stored — durable, decided, visible in SQL. This
+complements the wheel's storm handling: dispersion prevents storms
+from forming (the 09:00 cron fleet), the wheel drains the ones that
+form anyway (catch-up after downtime, backfill replay). Default zero,
+opt-in per schedule.
+
 ### Execution
 
 - Embedded mode: fired jobs run on an in-process worker pool with
