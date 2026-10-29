@@ -63,6 +63,8 @@ Pre-1.0, private until launch-ready. The build blueprint is
 - [ ] Embedded core: SQLite storage, single-node admission loop
 - [ ] Hierarchical time wheel, second-level fire precision
 - [ ] Delayed jobs + cron, typed handler API
+- [ ] Dispersion (jitter) windows per schedule
+- [ ] Retention: terminal-row TTL, background purge, size metrics
 - [ ] CLI: `stats`, `dlq ls`, `dlq replay`
 - [ ] Cluster storage: MySQL/TiDB partitioned scans, CAS admission
 - [ ] Cluster coordination: etcd shard registry, epoch-fenced handoff,
