@@ -168,11 +168,15 @@ Each gets a dedicated test with a fake clock.
 
 ## Contracts
 
-- Second-level fire precision from the wheel; durable truth in SQL.
-  In-memory state is a cache, never the owner.
-- At-least-once delivery; handlers must be idempotent.
-- Cancellation until the fire moment in wheel mode (epoch fencing stops
-  a zombie node's late shots). No cancellation promise after fire.
+- Jobs fire at the appointed second — never early, never skipped. The
+  wheel holds precision; the database holds truth; memory is a cache,
+  never the owner.
+- Jobs never orphan. At-least-once delivery with idempotent handlers;
+  crashed nodes' in-flight jobs are reclaimed by lease expiry and
+  re-fired within the misfire horizon.
+- Cancellation actually cancels. Until the fire moment in wheel mode;
+  epoch fencing stops a zombie node's late shots from resurrecting a
+  canceled job. No cancellation promise after fire.
 - Dead letters are queryable rows, replayable from the CLI.
 
 ## Benchmark methodology (v1.0 gate)

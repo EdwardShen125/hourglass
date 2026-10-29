@@ -42,13 +42,16 @@ the failures that shaped it, is documented here:
 
 ## Contracts
 
-- Second-level fire precision from the wheel; durable truth in SQL.
-  In-memory state is a cache of the database, never the owner.
-- At-least-once delivery, idempotent handlers. A node can die between
-  admission and delivery; the next owner re-fires within the misfire
-  horizon.
-- Epoch fencing. CAS writes carry the shard epoch; a previous owner's
-  late writes fail instead of corrupting state.
+- Jobs fire at the appointed second — never early, never skipped. The
+  wheel holds the admitted slice in memory; the database holds the
+  truth. In-memory state is a cache, never the owner.
+- Jobs never orphan. Delivery is at-least-once with idempotent
+  handlers; a crashed node's in-flight jobs are reclaimed by lease
+  expiry and re-fired within the misfire horizon — no stuck-active
+  states, no manual cleanup.
+- Cancellation actually cancels. Until the fire moment, cancel wins —
+  and epoch fencing stops a zombie node's late shots from resurrecting
+  a canceled job.
 - Dead letters are queryable rows. `hourglass dlq ls`, `hourglass dlq
   replay` — no lost topics, no console required.
 
