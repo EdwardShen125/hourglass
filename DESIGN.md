@@ -1,0 +1,201 @@
+# hourglass design
+
+This document is the build blueprint: the timing contract, the
+components, the state machines, and the failure model that makes the
+contracts true. It is written before the code; every deviation should
+either fix a mistake in this document or be reverted.
+
+Clean-room provenance: hourglass is rebuilt from a documented
+production design
+([write-up](https://edwardshen125.github.io/posts/engineering-case-study/building-a-production-go-scheduler-for-200k-delayed-jobs-per-second/)).
+No employer code is used.
+
+## Goals
+
+- Delayed jobs and cron, second-level fire precision.
+- Durable truth in SQL the user can query, join, and audit.
+- Embedded mode: one process, one SQLite file, zero services.
+- Cluster mode: same engine on partitioned MySQL/TiDB with etcd shard
+  ownership, no code change for the user.
+- At-least-once delivery with idempotent handlers; dead letters as
+  rows.
+
+## Non-goals
+
+- Workflow/DAG orchestration (dependencies between jobs). That is a
+  different problem with different tools.
+- Exactly-once delivery.
+- A required broker. (A delayed-queue delivery backend may arrive
+  post-1.0 for deployments that already run Pulsar or RocketMQ 5.x.)
+- Multi-language clients, a web console, or multi-tenancy before the
+  core is proven.
+
+## The timing contract
+
+Poll-based schedulers define fire precision as a polling interval: to
+fire closer to the appointed second, they query the database more
+often, across all pending jobs, forever. hourglass splits the contract:
+
+- The database keeps the **long horizon**: a job due in two days is a
+  quiet row. Nothing looks at it until its window approaches.
+- The wheel keeps the **precision**: a configurable lookahead window
+  ahead of now is admitted in batches (CAS), held in an in-process
+  hierarchical time wheel, and fired from memory at the appointed
+  second. The database is quiescent between admission windows.
+
+Consequence to plan for: the admitted slice lives in node memory, so
+the lookahead window is a memory budget, not just a contention knob.
+
+    wheel memory ≈ admission rate × lookahead window × bytes per timer
+
+At the ancestor system's 200K commands/s with a 30-minute window this
+is tens of GB — that scale belongs to cluster mode with short windows
+or a broker backend. Embedded mode targets thousands of jobs/s where a
+30-minute window is megabytes.
+
+## Components
+
+### Storage driver
+
+    type Store interface {
+        // Scan units: one for SQLite; one per partition for MySQL/TiDB.
+        Units(ctx) []ScanUnit
+        // Select waiting jobs in [from, to] ordered by due time, limit n.
+        Select(ctx, unit, from, to, n) []Job
+        // CAS waiting -> acquired, only for these ids, under this epoch.
+        Acquire(ctx, unit, epoch, ids) []Job
+        // Terminal transitions: complete, requeue, dead-letter.
+        Complete(ctx, job) / Requeue(ctx, job) / Dead(ctx, job, reason)
+        // Reclaim acquired rows whose lease expired (cluster mode).
+        Reclaim(ctx, unit, before) []Job
+    }
+
+- SQLite: one scan unit, plain index scan, single-writer.
+- MySQL/TiDB: explicit partition selection keeps each scan owned by
+  exactly one admission loop (see Shard registry). Acquire is a
+  conditional UPDATE ... WHERE state='waiting' AND id IN (...), with
+  the shard epoch recorded on the row.
+
+### Admission loop
+
+One loop per scan unit. Each tick:
+
+1. Compute the window: from the misfire floor (older of the unit's
+   tracked high-water mark and `now - misfire horizon`) to
+   `now + lookahead`.
+2. Select waiting jobs, ordered by due time, limited by available fire
+   capacity — never admit more than can be held or run.
+3. CAS-acquire the batch; re-read to confirm winners.
+4. Hand winners to the wheel. If the wheel rejects (full), release the
+   surplus back to waiting; nothing is lost.
+
+### Hierarchical wheel
+
+Kafka-style hierarchical timing wheel, per scan unit (per-shard wheels
+make handoff drain one wheel, not surgery on a shared one).
+
+- Insert O(1), tick advancement O(1) amortized, cascade on wheel
+  wraparound.
+- The fire path validates the shard epoch **per batch, before firing**:
+  a zombie node whose ownership was revoked must not deliver. This is
+  load-bearing correctness machinery, not an optimization.
+
+### Execution
+
+- Embedded mode: fired jobs run on an in-process worker pool with
+  per-queue concurrency caps. Cancellation is strong until the fire
+  moment.
+- Cluster mode: the DeliveryEngine (below) takes over.
+
+### DeliveryEngine (cluster mode)
+
+The `fired_record` row is the durable queue; memory is a cache.
+
+    wheel fires at T
+      -> INSERT fired_record(state=delivering)      # commit point
+      -> enqueue on the per-domain in-process queue  # fast path; may fail
+      -> gRPC push to a registered executor -> ack
+      -> UPDATE fired_record(state=delivered)
+
+- A domain's slow executor backs up only that domain's queue; when
+  full, new commands stay as `delivering` rows and a **reaper**
+  re-delivers them when capacity returns. Fire-side never blocks, so
+  one slow domain cannot stall shared partitions.
+- Executors register in etcd with lease TTL; routing is
+  least-outstanding per domain.
+- Retry with exponential backoff, bounded; then `state=dead`. Dead
+  letters are rows: `hourglass dlq ls`, `hourglass dlq replay`.
+
+### Shard registry (cluster mode)
+
+- Each scheduling node holds an etcd lease and claims partitions.
+- Ownership records carry a monotonically increasing **epoch**.
+- Handoff, graceful: stop admitting, drain the wheel (fire what is due
+  or requeue what is not), release.
+- Handoff, ungraceful: lease expires; the new owner bumps the epoch and
+  reclaims `acquired` rows whose lease is stale, then rescans the
+  misfire horizon. The old owner's late CAS writes fail the epoch check.
+
+## State machines
+
+Job:
+
+    waiting -> acquired (CAS, epoch recorded)
+    acquired -> fired (wheel fired, handler dispatched)
+    fired -> completed
+    fired -> dead (retries exhausted)
+    waiting -> canceled (strong cancel, before admission)
+    acquired -> canceled (wheel mode, before fire; epoch-fenced)
+    completed -> waiting (cron with a next occurrence)
+
+fired_record (cluster): delivering -> delivered | dead; dead ->
+delivering (replay).
+
+## The four load-bearing pieces
+
+These are the parts whose absence silently corrupts the contracts.
+Each gets a dedicated test with a fake clock.
+
+1. **Epoch validation on the wheel fire path** — zombie nodes must not
+   deliver after handoff.
+2. **Acquired-row lease + reclaim** — a new owner distinguishes
+   might-still-be-publishing from safely-reclaimable.
+3. **Misfire rescan horizon** — the wheel is lossy by design; the
+   horizon must cover the admitted-but-undelivered window (lookahead +
+   queue depth + retry budget).
+4. **fired_record as truth** — in-memory queues are caches; reapers and
+   takeovers recover everything the caches dropped.
+
+## Contracts
+
+- Second-level fire precision from the wheel; durable truth in SQL.
+  In-memory state is a cache, never the owner.
+- At-least-once delivery; handlers must be idempotent.
+- Cancellation until the fire moment in wheel mode (epoch fencing stops
+  a zombie node's late shots). No cancellation promise after fire.
+- Dead letters are queryable rows, replayable from the CLI.
+
+## Benchmark methodology (v1.0 gate)
+
+The launch claim lives or dies on these, all scripts in-repo and
+reproducible:
+
+1. **Fire precision**: p99/p999 of |actual − scheduled| for a
+   randomized schedule, hourglass vs a poll-based baseline at default
+   settings.
+2. **Hot minute**: N=100K jobs due at the same second — time to drain,
+   database QPS during the storm, per-second fire curve.
+3. **Quiescence**: database query rate while idle with 1M pending jobs
+   (wheel admits in windows; pollers never stop asking).
+4. **Ceiling**: sustained admission+fire rate, single embedded process;
+   cluster scaling is post-1.0.
+
+Baselines: asynq and river at their defaults, same hardware, same
+randomized schedule seed.
+
+## Deployment modes
+
+| mode | store | coordination | delivery | target |
+| --- | --- | --- | --- | --- |
+| embedded | SQLite | none | in-process workers | apps, ≤ thousands of jobs/s |
+| cluster | MySQL/TiDB | etcd | DeliveryEngine + gRPC executors | platforms, hot storms, HA |

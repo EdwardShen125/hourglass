@@ -54,7 +54,8 @@ the failures that shaped it, is documented here:
 
 ## Status
 
-Pre-1.0, private until launch-ready. v1.0 scope:
+Pre-1.0, private until launch-ready. The build blueprint is
+[DESIGN.md](DESIGN.md). v1.0 scope:
 
 - [ ] Embedded core: SQLite storage, single-node admission loop
 - [ ] Hierarchical time wheel, second-level fire precision
