@@ -197,6 +197,38 @@ reproducible:
 Baselines: asynq and river at their defaults, same hardware, same
 randomized schedule seed.
 
+## The broker alternative
+
+The ancestor of this design ran a heavier shape in production: SQL for
+the long horizon, a delayed-delivery broker (Pulsar deliverAt / RocketMQ
+5.x timers) for the near horizon, etcd for sharding — 200K commands/s,
+measured. It works. It is not the v1 core, for three reasons:
+
+1. **Cancellation boundary.** Once published, a delayed message cannot
+   be canceled — no broker implements it. Wheel mode cancels until the
+   fire moment; broker mode cancels until admission. The production
+   ancestor removed its Redis-based cancel layer and fixed the boundary
+   at admission the hard way.
+2. **Precision sovereignty.** Broker deliverAt precision is the
+   broker's tracker interval and its delayed index lives on the broker
+   heap — millions of outstanding delayed messages become someone
+   else's memory problem (and a hot minute becomes a consumer storm).
+3. **Dependency funnel.** SQL + broker + etcd is three systems before
+   the first job fires. It cannot be the 30-second start.
+
+So the broker shape is kept as a post-1.0 delivery driver
+(`delayedQueueSink`), not the core. If built, it inherits two seam
+contracts from the ancestor's scars:
+
+- The crash seam is **CAS-admit → publish**: a row acquired but never
+  published must be found by lease-expiry rescan. At-least-once makes
+  the reverse seam (published, mark lost) a duplicate, not a loss.
+- Cancellation ends at admission. Documented, not hidden.
+
+Per-domain mixing stays the end state: wheel domains for precision and
+cancellation, broker domains for near-term volume — each domain picks
+its failure model.
+
 ## Deployment modes
 
 | mode | store | coordination | delivery | target |
