@@ -65,6 +65,8 @@ Pre-1.0, private until launch-ready. The build blueprint is
 - [ ] Delayed jobs + cron, typed handler API
 - [ ] Dispersion (jitter) windows per schedule
 - [ ] Retention: terminal-row TTL, background purge, size metrics
+- [ ] Execution log: attempts, receipts, idempotency keys in core
+      schema
 - [ ] CLI: `stats`, `dlq ls`, `dlq replay`
 - [ ] Cluster storage: MySQL/TiDB partitioned scans, CAS admission
 - [ ] Cluster coordination: etcd shard registry, epoch-fenced handoff,
@@ -73,8 +75,11 @@ Pre-1.0, private until launch-ready. The build blueprint is
 - [ ] Benchmarks: fire-time precision and throughput vs poll-based
       schedulers
 
-Post-1.0, on demand: delayed-queue delivery backends (Pulsar,
-RocketMQ 5.x `deliver-at`) for deployments that already run a broker.
+Post-1.0, on demand: an MCP agent face (`hourglass mcp`, declarative
+webhook targets, self-chaining acks) — durable time for agents that
+cannot hold their own futures — plus delayed-queue delivery backends
+(Pulsar, RocketMQ 5.x `deliver-at`) for deployments that already run
+a broker.
 
 ## Comparison
 

@@ -19,12 +19,24 @@ No employer code is used.
   ownership, no code change for the user.
 - At-least-once delivery with idempotent handlers; dead letters as
   rows.
+- Durable time for agents (v1.x face): declarative jobs, queryable
+  receipts, self-chaining — with the engine never calling a model.
 
 ## Non-goals
 
 - Workflow/DAG orchestration (dependencies between jobs). That is a
   different problem with different tools.
 - Exactly-once delivery.
+- Step replay or a durable-execution journal. hourglass is the durable
+  time layer, not the state layer; compose it with Temporal or Restate
+  when a loop needs replay.
+- Natural-language time parsing. The agent converts "tomorrow morning"
+  into an exact time; hourglass accepts only exact times.
+- Calling models, ever. Execution returns to the scheduling host
+  (sampling callback) or a declared target; the engine stays free of
+  LLM dependencies.
+- Agent memory and agent-to-agent protocols. Watch list, not build
+  list.
 - A required broker. (A delayed-queue delivery backend may arrive
   post-1.0 for deployments that already run Pulsar or RocketMQ 5.x.)
 - Multi-language clients, a web console, or multi-tenancy before the
@@ -119,10 +131,23 @@ opt-in per schedule.
   per-queue concurrency caps. Cancellation is strong until the fire
   moment.
 - Cluster mode: the DeliveryEngine (below) takes over.
+- **Declarative targets (v1.x, agent face)**: a job may carry its own
+  delivery address instead of referring to a registered handler —
+  `target_type` + `target_ref` on the row. Three types: `webhook`
+  (HMAC-SHA256-signed POST; the per-job secret ships at submit so the
+  target can verify origin), `sampling` (the prompt is handed back to
+  the scheduling host's MCP client), `handler` (library-mode
+  registered function).
+- **The execution log is core, not cluster-only**: every attempt and
+  every fire is a receipt row — idempotency key included — in both
+  embedded and cluster modes. "Did this side effect happen?" is a
+  SELECT on every deployment shape.
 
-### DeliveryEngine (cluster mode)
+### Remote delivery (cluster mode)
 
-The `fired_record` row is the durable queue; memory is a cache.
+The receipt half of `fired_record` is core schema (see Execution);
+this section is the remote-push half. The `fired_record` row is the
+durable queue; memory is a cache.
 
     wheel fires at T
       -> INSERT fired_record(state=delivering)      # commit point
@@ -165,10 +190,14 @@ Job:
     fired -> dead (retries exhausted)
     waiting -> canceled (strong cancel, before admission)
     acquired -> canceled (wheel mode, before fire; epoch-fenced)
-    completed -> waiting (cron with a next occurrence)
+    completed -> waiting (reschedule: cron next occurrence, or an
+    executor ack carrying reschedule_at — one edge, two callers)
 
-fired_record (cluster): delivering -> delivered | dead; dead ->
-delivering (replay).
+    canceled rows persist as receipts (with reason) until retention
+    expires — "was planned, was revoked" is audit data.
+
+fired_record (remote delivery): delivering -> delivered | dead;
+dead -> delivering (replay).
 
 ## Retention and growth
 
@@ -208,7 +237,11 @@ Each gets a dedicated test with a fake clock.
   re-fired within the misfire horizon.
 - Cancellation actually cancels. Until the fire moment in wheel mode;
   epoch fencing stops a zombie node's late shots from resurrecting a
-  canceled job. No cancellation promise after fire.
+  canceled job. No cancellation promise after fire. Cancellations
+  persist as receipts: plans leave footprints.
+- Every fire is a queryable receipt. Idempotency keys are stored,
+  attempts are rows; an agent can prove what happened and what never
+  did.
 - Dead letters are queryable rows, replayable from the CLI.
 
 ## Benchmark methodology (v1.0 gate)
@@ -225,6 +258,9 @@ reproducible:
    (wheel admits in windows; pollers never stop asking).
 4. **Ceiling**: sustained admission+fire rate, single embedded process;
    cluster scaling is post-1.0.
+5. **Sleeping agents**: the same monitor loop as an always-on polling
+   process vs an hourglass self-chained wakeup — DB queries per hour,
+   wakeups, CPU. The cost chart for "agents that sleep".
 
 Baselines: asynq and river at their defaults, same hardware, same
 randomized schedule seed.
@@ -261,12 +297,42 @@ Per-domain mixing stays the end state: wheel domains for precision and
 cancellation, broker domains for near-term volume — each domain picks
 its failure model.
 
+## The agent face (v1.x)
+
+Agents cannot hold their own futures: they run ephemerally, on
+untrusted hosts, inside serverless sandboxes. A promise to act in two
+hours is worthless without an external custodian — which is why every
+serious agent platform re-implements a durable timer service
+(Temporal's per-shard timer queues, Restate's journaled timers,
+Durable Object alarms) while the long tail that will not run an
+engine polls SQLite every 60 seconds. hourglass's position: the
+durable time layer, extracted and standalone — engine-agnostic,
+model-free, contract-first.
+
+The face is three pieces, all riding the v1.0 engine unchanged:
+
+1. `hourglass mcp` — an MCP server (stdio locally, streamable HTTP
+   remotely) exposing `schedule`, `cancel`, `list`, `receipts`, `dlq`.
+   Built on the official modelcontextprotocol/go-sdk. Thin adapter,
+   no business logic.
+2. Declarative delivery targets (see Execution) — a job carries its
+   own address; webhook deliveries are HMAC-signed.
+3. Self-chaining via `reschedule_at` in the ack — "call me again in
+   30 minutes" turns polling agents into sleeping agents.
+
+Patterns the face enables with zero new engine features: timeout
+escorts (a deadline timer beside every human-in-the-loop wait;
+arrival of the event cancels the escort), durable monitor loops
+(self-chaining), cron briefings. What hourglass deliberately is not:
+a step-replay engine, an NL time parser, a model caller, an agent
+memory — the fences in Non-goals.
+
 ## Deployment modes
 
-| mode | store | coordination | delivery | target |
-| --- | --- | --- | --- | --- |
-| embedded | SQLite | none | in-process workers | apps, ≤ thousands of jobs/s |
-| cluster | MySQL/TiDB | etcd | DeliveryEngine + gRPC executors | platforms, hot storms, HA |
+| mode | store | coordination | delivery | agent face | target |
+| --- | --- | --- | --- | --- | --- |
+| embedded | SQLite | none | in-process workers + targets | `hourglass mcp` (stdio) | apps, agents, ≤ thousands of jobs/s |
+| cluster | MySQL/TiDB | etcd | remote delivery + gRPC executors | `hourglass mcp` (HTTP) | platforms, agent fleets, hot storms, HA |
 
 ## Implementation notes (deferred, recorded)
 
@@ -277,3 +343,8 @@ its failure model.
   field from day one (executor self-chaining: drip patterns,
   executor-driven retries); adding a field later costs a protocol
   migration, reserving it costs nothing.
+- Webhook targets sign payloads with HMAC-SHA256; the per-job secret
+  is generated at submit and returned once — verification is a
+  shared-secret check, no PKI.
+- The MCP `receipts` tool is first-class, not an afterthought: agent
+  self-audit is a headline use of the face.
