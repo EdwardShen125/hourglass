@@ -184,6 +184,8 @@ durable queue; memory is a cache.
 
 Job:
 
+    dormant -> waiting (v1.x: an anchor event materializes an exact
+    due; until then the job is a quiet row)
     waiting -> acquired (CAS, epoch recorded)
     acquired -> fired (wheel fired, handler dispatched)
     fired -> completed
@@ -320,12 +322,32 @@ The face is three pieces, all riding the v1.0 engine unchanged:
 3. Self-chaining via `reschedule_at` in the ack — "call me again in
    30 minutes" turns polling agents into sleeping agents.
 
-Patterns the face enables with zero new engine features: timeout
-escorts (a deadline timer beside every human-in-the-loop wait;
-arrival of the event cancels the escort), durable monitor loops
-(self-chaining), cron briefings. What hourglass deliberately is not:
-a step-replay engine, an NL time parser, a model caller, an agent
-memory — the fences in Non-goals.
+Agent-native primitives (v1.x engine additions):
+
+- **Event-anchored delays** — `after(event, delay, then)`: the job
+  lies dormant until an idempotent anchor signal (webhook or SDK)
+  arrives, then materializes as an exact-due job and rides everything
+  above. One new state edge, no new engine.
+- **Debounce windows** — a merge key plus a window: new requests
+  reset the window and collapse into one wake. Bursty monitoring
+  becomes one considered message. Complements jitter: jitter melts
+  storms before they form, debounce merges storms of attention.
+- **Wake packs** — payloads are pointer + question, never frozen
+  context: the wake carries an episode/memory id, the agent pulls
+  detail on demand. A hundred thousand pending wakes must not be a
+  hundred thousand frozen contexts.
+- **Authorization envelope** — the wake ships with its schedule-time
+  authorization context, so a fire days later surfaces "you
+  authorized X on <date>" inside the agent loop for explicit
+  re-validation. The scheduler never enforces; it guarantees the
+  evidence chain.
+
+Patterns enabled with zero new engine features: timeout escorts (a
+deadline timer beside every human-in-the-loop wait; the event's
+arrival cancels the escort), durable monitor loops (self-chaining),
+cron briefings. What hourglass deliberately is not: a step-replay
+engine, an NL time parser, a model caller, an agent memory — the
+fences in Non-goals.
 
 ## Deployment modes
 
@@ -333,6 +355,17 @@ memory — the fences in Non-goals.
 | --- | --- | --- | --- | --- | --- |
 | embedded | SQLite | none | in-process workers + targets | `hourglass mcp` (stdio) | apps, agents, ≤ thousands of jobs/s |
 | cluster | MySQL/TiDB | etcd | remote delivery + gRPC executors | `hourglass mcp` (HTTP) | platforms, agent fleets, hot storms, HA |
+
+## The enterprise bar
+
+The engine is built to the enterprise bar from day one — SQL audit,
+epoch fencing, HA handoff, receipts — but the adoption ladder runs
+bottom-up: developer embedded (the 30-second start) → team library →
+enterprise self-host (multi-tenancy via domains, OTel metrics, a
+security model with signed deliveries and secret rotation, a capacity
+planning guide). The enterprise is the last rung that the lower rungs
+fill, not the first door; nothing multi-tenant ships before the core
+is proven.
 
 ## Implementation notes (deferred, recorded)
 

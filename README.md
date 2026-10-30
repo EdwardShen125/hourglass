@@ -57,8 +57,9 @@ the failures that shaped it, is documented here:
 
 ## Status
 
-Pre-1.0, private until launch-ready. The build blueprint is
-[DESIGN.md](DESIGN.md). v1.0 scope:
+Pre-1.0, private until launch-ready. Built to the enterprise bar
+(audit, fencing, HA handoff), entered through the 30-second start;
+the build blueprint is [DESIGN.md](DESIGN.md). v1.0 scope:
 
 - [ ] Embedded core: SQLite storage, single-node admission loop
 - [ ] Hierarchical time wheel, second-level fire precision
@@ -76,10 +77,10 @@ Pre-1.0, private until launch-ready. The build blueprint is
       schedulers
 
 Post-1.0, on demand: an MCP agent face (`hourglass mcp`, declarative
-webhook targets, self-chaining acks) — durable time for agents that
-cannot hold their own futures — plus delayed-queue delivery backends
-(Pulsar, RocketMQ 5.x `deliver-at`) for deployments that already run
-a broker.
+webhook targets, self-chaining acks, event-anchored delays, debounce
+windows) — durable time for agents that cannot hold their own
+futures — plus delayed-queue delivery backends (Pulsar, RocketMQ 5.x
+`deliver-at`) for deployments that already run a broker.
 
 ## Comparison
 
