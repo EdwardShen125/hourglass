@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -45,7 +46,7 @@ type engine struct {
 	// dispatch delivers fired entries to handlers on a worker pool,
 	// outside the wheel lock: one slow handler must not stall ticks,
 	// admission, or cancel.
-	dispatch chan wheelEntry
+	dispatch chan wheelTask
 	wg       sync.WaitGroup
 }
 
@@ -68,7 +69,7 @@ func newEngine(s Store, clk clock, cfg engineConfig) *engine {
 		cfg:      cfg,
 		epoch:    1,
 		handlers: make(map[string]Handler),
-		dispatch: make(chan wheelEntry, 1024),
+		dispatch: make(chan wheelTask, 1024),
 	}
 	e.wheel = newWheel(clk, e.epoch)
 	e.startWorkers()
@@ -81,8 +82,8 @@ func (e *engine) startWorkers() {
 		e.wg.Add(1)
 		go func() {
 			defer e.wg.Done()
-			for entry := range e.dispatch {
-				e.fireEntry(entry)
+			for task := range e.dispatch {
+				e.fireEntry(task)
 			}
 		}()
 	}
@@ -228,47 +229,158 @@ func (e *engine) release(ctx context.Context, ids []string) error {
 	return nil
 }
 
-// pump advances the wheel to now and dispatches what fires to the
-// worker pool (handlers never run under the wheel lock).
+// pump advances the wheel to now, batch-advances the fired batch's
+// state (one statement per tick per target state), then dispatches
+// entries to the worker pool (handlers never run under the wheel
+// lock). Handler bodies see rows already in fired; completion is
+// aggregated per batch: done/dead ids are collected by the workers and
+// flushed as one batched transition + one receipt batch each.
 func (e *engine) pump(now time.Time) {
-	for _, entry := range e.wheel.Tick(now) {
-		e.dispatch <- entry
+	batch := e.wheel.Tick(now)
+	if len(batch) == 0 {
+		return
 	}
-}
-
-// fireEntry is the dispatch path: CAS to fired, run handler, complete
-// or dead-letter, reschedule cron jobs.
-func (e *engine) fireEntry(entry wheelEntry) {
 	ctx := context.Background()
-	now := e.clk.Now()
-	if err := e.transition(ctx, entry.id, Acquired, Fired); err != nil {
-		return // canceled meanwhile or lost race — skip delivery
+	ids := make([]string, len(batch))
+	for i, en := range batch {
+		ids[i] = en.id
 	}
-	_ = e.store.(*sqliteStore).addReceipt(ctx, entry.id, "fired", "", "", "fired", now)
-	j, err := e.store.Get(ctx, entry.id)
+	// acquired -> fired for the whole batch (canceled rows simply lose)
+	if err := e.transitionBatch(ctx, Acquired, Fired, ids, now); err != nil {
+		return
+	}
+	_ = e.store.(*sqliteStore).addReceiptBatch(ctx, ids, "fired", "", "", "fired", now)
+
+	// one re-read for the whole batch: handlers get their job row without
+	// a per-job Get
+	jobs, err := e.store.(*sqliteStore).getMany(ctx, ids)
 	if err != nil {
 		return
 	}
+	// filter raced-away rows (canceled between transition and re-read)
+	// BEFORE arming the collector: the expected count must be exact or
+	// the flush never fires
+	deliver := make([]wheelTask, 0, len(batch))
+	for _, entry := range batch {
+		j, ok := jobs[entry.id]
+		if !ok || j.State != Fired {
+			continue // never handed to a handler: no delivery, no death
+		}
+		deliver = append(deliver, wheelTask{job: j})
+	}
+	if len(deliver) == 0 {
+		return
+	}
+	res := newBatchResult(len(deliver))
+	for i := range deliver {
+		deliver[i].res = res
+		e.dispatch <- deliver[i]
+	}
+	res.setFlush(func(doneIds, deadIds []string, deadErrs map[string]string) {
+		if len(doneIds) > 0 {
+			_ = e.transitionBatch(ctx, Fired, Completed, doneIds, now)
+			_ = e.store.(*sqliteStore).addReceiptBatch(ctx, doneIds, "completed", "", "", "completed", now)
+			for _, id := range doneIds {
+				e.maybeReschedule(ctx, id)
+			}
+		}
+		if len(deadIds) > 0 {
+			_ = e.transitionBatch(ctx, Fired, Dead, deadIds, now)
+			// dead receipts carry the handler error; one per job in a
+			// single statement per distinct error text
+			byErr := make(map[string][]string)
+			for id, txt := range deadErrs {
+				byErr[txt] = append(byErr[txt], id)
+			}
+			for txt, group := range byErr {
+				_ = e.store.(*sqliteStore).addReceiptBatch(ctx, group, "dead", txt, "", "dead", now)
+			}
+		}
+	})
+}
+
+// batchResult collects per-job handler outcomes for one pump batch and
+// flushes them once, batched.
+type batchResult struct {
+	pending atomic.Int64
+	mu      sync.Mutex
+	doneIds []string
+	deadErr map[string]string // id -> error text
+	flushed bool
+	fn      func(doneIds, deadIds []string, deadErrs map[string]string)
+}
+
+func newBatchResult(n int) *batchResult {
+	br := &batchResult{deadErr: map[string]string{}}
+	br.pending.Store(int64(n))
+	return br
+}
+
+func (r *batchResult) complete(id string, herr error) {
+	r.mu.Lock()
+	if herr == nil {
+		r.doneIds = append(r.doneIds, id)
+	} else {
+		r.deadErr[id] = herr.Error()
+	}
+	r.mu.Unlock()
+	if r.pending.Add(-1) == 0 {
+		r.flush()
+	}
+}
+
+// setFlush installs the flush callback; if all outcomes already
+// arrived, flush immediately.
+func (r *batchResult) setFlush(fn func(doneIds, deadIds []string, deadErrs map[string]string)) {
+	r.mu.Lock()
+	r.fn = fn
+	r.mu.Unlock()
+	if r.pending.Load() == 0 {
+		r.flush()
+	}
+}
+
+func (r *batchResult) flush() {
+	r.mu.Lock()
+	if r.flushed || r.fn == nil {
+		r.mu.Unlock()
+		return
+	}
+	r.flushed = true
+	fn, doneIds := r.fn, r.doneIds
+	deadCopy := make(map[string]string, len(r.deadErr))
+	for k, v := range r.deadErr {
+		deadCopy[k] = v
+	}
+	var deadIds []string
+	for id := range deadCopy {
+		deadIds = append(deadIds, id)
+	}
+	r.mu.Unlock()
+	fn(doneIds, deadIds, deadCopy)
+}
+
+// wheelTask pairs a fired job with its batch result collector.
+type wheelTask struct {
+	job Job
+	res *batchResult
+}
+
+// fireEntry is the dispatch path: run the handler on the carried job
+// row and report the outcome to the batch collector. State writes
+// happen in the batch flush (one statement per tick per target state),
+// not per job — the hot minute must not be a write storm.
+func (e *engine) fireEntry(task wheelTask) {
+	ctx := context.Background()
+	j := task.job
 	h := e.handlerFor(j.Topic)
 	var herr error
 	if h == nil {
 		herr = fmt.Errorf("hourglass: no handler for topic %q", j.Topic)
 	} else {
-		herr = h(ctx, *j)
+		herr = h(ctx, j)
 	}
-	next := Completed
-	if herr != nil {
-		next = Dead // v1: single attempt; retry policy is a v1.0 item
-	}
-	_ = e.transition(ctx, entry.id, Fired, next)
-	kind, errText := "completed", ""
-	if next == Dead {
-		kind, errText = "dead", herr.Error()
-	}
-	_ = e.store.(*sqliteStore).addReceipt(ctx, entry.id, kind, errText, "", string(next), e.clk.Now())
-	if next == Completed {
-		e.maybeReschedule(ctx, entry.id)
-	}
+	task.res.complete(j.ID, herr)
 }
 
 func (e *engine) handlerFor(topic string) Handler {
@@ -282,6 +394,14 @@ func (e *engine) handlerFor(topic string) Handler {
 func (e *engine) transition(ctx context.Context, id string, from, to State) error {
 	return e.store.(*sqliteStore).transition(ctx, id, from, to)
 }
+
+// transitionBatch is the batched form (one statement per tick).
+func (e *engine) transitionBatch(ctx context.Context, from, to State, ids []string, at time.Time) error {
+	return e.store.(*sqliteStore).transitionBatch(ctx, from, to, ids, at)
+}
+
+// stmtCount exposes the store's statement counter (tests only).
+func (e *engine) stmtCount() int64 { return e.store.(*sqliteStore).stmtCount() }
 
 // Run drives admission and wheel ticks on a one-second cadence until
 // ctx is done.

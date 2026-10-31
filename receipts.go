@@ -2,6 +2,7 @@ package hourglass
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
@@ -33,9 +34,26 @@ CREATE INDEX IF NOT EXISTS idx_receipts_job ON receipts(job_id, at);
 `
 
 func (s *sqliteStore) addReceipt(ctx context.Context, jobID, kind, errText, reason, state string, at time.Time) error {
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO receipts (id, job_id, kind, attempt, error, reason, at, state) VALUES (?, ?, ?, 1, ?, ?, ?, ?)`,
-		newID(), jobID, kind, errText, reason, at.Unix(), state)
+	return s.addReceiptBatch(ctx, []string{jobID}, kind, errText, reason, state, at)
+}
+
+// addReceiptBatch writes one receipt per job in a single multi-VALUES
+// INSERT: the hot minute must not be a receipt write storm.
+func (s *sqliteStore) addReceiptBatch(ctx context.Context, jobIDs []string, kind, errText, reason, state string, at time.Time) error {
+	if len(jobIDs) == 0 {
+		return nil
+	}
+	var sb strings.Builder
+	sb.WriteString(`INSERT INTO receipts (id, job_id, kind, attempt, error, reason, at, state) VALUES `)
+	args := make([]any, 0, len(jobIDs)*8)
+	for i, jobID := range jobIDs {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString("(?, ?, ?, 1, ?, ?, ?, ?)")
+		args = append(args, newID(), jobID, kind, errText, reason, at.Unix(), state)
+	}
+	_, err := s.db.ExecContext(ctx, sb.String(), args...)
 	return err
 }
 

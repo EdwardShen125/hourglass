@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -20,7 +21,7 @@ func newSQLiteStore(path string) (*sqliteStore, error) {
 	// Single-writer store: one connection serializes writes and keeps
 	// SQLite honest under concurrent admission.
 	db.SetMaxOpenConns(1)
-	s := &sqliteStore{db: db}
+	s := &sqliteStore{db: &countingDB{DB: db}}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
@@ -29,7 +30,20 @@ func newSQLiteStore(path string) (*sqliteStore, error) {
 }
 
 type sqliteStore struct {
-	db *sql.DB
+	db *countingDB
+}
+
+// countingDB counts write statements (ExecContext) so tests can assert
+// batching behavior: one tick's fire path must be O(batches) writes,
+// not O(jobs). Reads are not counted — waiting loops poll with SELECTs.
+type countingDB struct {
+	*sql.DB
+	stmts atomic.Int64
+}
+
+func (c *countingDB) ExecContext(ctx context.Context, q string, args ...any) (sql.Result, error) {
+	c.stmts.Add(1)
+	return c.DB.ExecContext(ctx, q, args...)
 }
 
 const schema = `
@@ -223,6 +237,67 @@ func (s *sqliteStore) transition(ctx context.Context, id string, from, to State)
 	}
 	return nil
 }
+
+// transitionBatch advances many rows along one legal edge in a single
+// UPDATE ... WHERE state = from AND id IN (...). Rows not in from are
+// skipped silently (races lose). Returns nothing: the engine treats
+// skipped rows as gone (canceled meanwhile).
+func (s *sqliteStore) transitionBatch(ctx context.Context, from, to State, ids []string, at time.Time) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if !legalEdges[[2]State{from, to}] {
+		return fmt.Errorf("hourglass: illegal edge %s -> %s (batch of %d)", from, to, len(ids))
+	}
+	ph := strings.Repeat("?,", len(ids))
+	q := `UPDATE jobs SET state = ? WHERE state = ? AND id IN (` + ph[:len(ph)-1] + `)`
+	args := make([]any, 0, len(ids)+2)
+	args = append(args, string(to), string(from))
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	_, err := s.db.ExecContext(ctx, q, args...)
+	return err
+}
+
+// stmtCount exposes the statement counter (tests only).
+func (s *sqliteStore) listAll(ctx context.Context) ([]Job, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, topic, payload, due, sched_at, state, cron, cancel_reason FROM jobs`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanJobs(rows)
+}
+
+// getMany fetches job rows by id set in one statement (pump re-read).
+func (s *sqliteStore) getMany(ctx context.Context, ids []string) (map[string]Job, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	ph := strings.Repeat("?,", len(ids))
+	q := `SELECT id, topic, payload, due, sched_at, state, cron, cancel_reason FROM jobs WHERE id IN (` + ph[:len(ph)-1] + `)`
+	args := make([]any, 0, len(ids))
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]Job, len(ids))
+	list, err := scanJobs(rows)
+	if err != nil {
+		return nil, err
+	}
+	for _, j := range list {
+		out[j.ID] = j
+	}
+	return out, nil
+}
+
+func (s *sqliteStore) stmtCount() int64 { return s.db.stmts.Load() }
 
 func newID() string {
 	b := make([]byte, 16)

@@ -5,7 +5,6 @@ package hourglass
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -53,7 +52,7 @@ type Job struct {
 
 // Handle is an hourglass engine bound to one store.
 type Handle struct {
-	db    *sql.DB
+	db    *countingDB
 	store Store
 	eng   *engine
 	clk   clock
