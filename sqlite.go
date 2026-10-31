@@ -26,8 +26,30 @@ func newSQLiteStore(path string) (*sqliteStore, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := s.recover(ctxTODO(), time.Now()); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("hourglass: crash recovery: %w", err)
+	}
 	return s, nil
 }
+
+// recover requeues in-flight rows left by a crashed process: acquired
+// and fired flip back to waiting, so the next admission re-fires them
+// (at-least-once; DESIGN.md "jobs never orphan"). Terminal rows
+// (completed/dead/canceled) are receipts and stay untouched.
+//
+// Embedded mode owns the whole store, so "another live engine holds
+// these rows" cannot happen; in cluster mode this becomes lease-expiry
+// reclaim under epoch fencing instead.
+func (s *sqliteStore) recover(ctx context.Context, now time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE jobs SET state='waiting', epoch=0 WHERE state IN ('acquired','fired')`)
+	return err
+}
+
+// ctxTODO: recovery runs before any caller context exists; background
+// is fine (embedded store, no cancellation deadline).
+func ctxTODO() context.Context { return context.Background() }
 
 type sqliteStore struct {
 	db *countingDB
