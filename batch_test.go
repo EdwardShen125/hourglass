@@ -89,15 +89,17 @@ func TestFirePathWritesBatchedReceiptsAndTransitions(t *testing.T) {
 	// the flush callback fires after the last handler outcome; hook it by
 	// waiting for all jobs completed via receipts count = 2n (single
 	// query poll, coarse).
-	deadline := time.Now().Add(5 * time.Second)
+	// wait until every job has both receipts (fired + completed); FAIL on
+	// timeout instead of silently proceeding (review: vacuous waits)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		var total int64
-		e.store.(*sqliteStore).db.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM receipts`).Scan(&total)
-		if total >= 2*int64(n) {
+		if allJobsHaveTwoReceipts(t, e, ctx, n) {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+	if !allJobsHaveTwoReceipts(t, e, ctx, n) {
+		t.Fatal("flush did not complete within 10s (batch wedged or spilled without re-admission)")
 	}
 	// under -race the workers run slower; the countingDB atomic is fine
 	// but each poll's COUNT(*) is counted. 225 - ~4N polls... instead of
@@ -114,21 +116,6 @@ func TestFirePathWritesBatchedReceiptsAndTransitions(t *testing.T) {
 		t.Fatalf("pump for %d jobs issued %d write statements; batching not effective", n, writes)
 	}
 	_ = flushed
-	deadline2 := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline2) {
-		ok := true
-		for _, id := range jobIDs(t, e) {
-			rs, _ := e.store.(*sqliteStore).receipts(ctx, id)
-			if len(rs) != 2 {
-				ok = false
-				break
-			}
-		}
-		if ok {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
 	for _, id := range jobIDs(t, e) {
 		rs, err := e.store.(*sqliteStore).receipts(ctx, id)
 		if err != nil {
@@ -138,6 +125,21 @@ func TestFirePathWritesBatchedReceiptsAndTransitions(t *testing.T) {
 			t.Fatalf("job %s: %d receipts, want 2", id, len(rs))
 		}
 	}
+}
+
+func allJobsHaveTwoReceipts(t *testing.T, e *engine, ctx context.Context, want int) bool {
+	t.Helper()
+	ids := jobIDs(t, e)
+	if len(ids) != want {
+		return false
+	}
+	for _, id := range ids {
+		rs, _ := e.store.(*sqliteStore).receipts(ctx, id)
+		if len(rs) < 2 {
+			return false
+		}
+	}
+	return true
 }
 
 func jobIDs(t *testing.T, e *engine) []string {

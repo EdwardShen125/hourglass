@@ -16,11 +16,33 @@ type Handler func(ctx context.Context, j Job) error
 // memory budget: wheel memory ≈ admission rate × lookahead × bytes per
 // timer (DESIGN.md).
 type engineConfig struct {
-	lookahead   time.Duration
-	admitLimit  int
-	misfireHalo time.Duration // how far back the window floor reaches
-	workers     int           // handler dispatch concurrency
-	retention   time.Duration // terminal-row TTL (default 7d)
+	lookahead    time.Duration
+	admitLimit   int
+	misfireHalo  time.Duration // how far back the window floor reaches
+	workers      int           // handler dispatch concurrency
+	retention    time.Duration // terminal-row TTL (default 7d)
+	dispatchSize int           // dispatch channel buffer (default 1024)
+}
+
+// quietUntil accessors: the watermark is written by Submit/step from
+// different goroutines; guard it with the engine mutex.
+func (e *engine) setQuietUntil(t time.Time) {
+	e.mu.Lock()
+	e.quietUntil = t
+	e.mu.Unlock()
+}
+
+func (e *engine) quietUntilNow() time.Time {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.quietUntil
+}
+
+func dispatchSizeOrDefault(n int) int {
+	if n <= 0 {
+		return 1024
+	}
+	return n
 }
 
 func defaultEngineConfig() engineConfig {
@@ -53,6 +75,7 @@ type engine struct {
 	// admission, or cancel.
 	dispatch chan wheelTask
 	wg       sync.WaitGroup
+	done     chan struct{} // closed by Close: stops pump sends and Run
 }
 
 func newEngine(s Store, clk clock, cfg engineConfig) *engine {
@@ -77,7 +100,8 @@ func newEngine(s Store, clk clock, cfg engineConfig) *engine {
 		cfg:      cfg,
 		epoch:    1,
 		handlers: make(map[string]Handler),
-		dispatch: make(chan wheelTask, 1024),
+		dispatch: make(chan wheelTask, dispatchSizeOrDefault(cfg.dispatchSize)),
+		done:     make(chan struct{}),
 	}
 	e.wheel = newWheel(clk, e.epoch)
 	e.startWorkers()
@@ -127,6 +151,9 @@ func (e *engine) Submit(ctx context.Context, topic string, payload []byte, opts 
 	if err := e.store.Insert(ctx, j); err != nil {
 		return "", err
 	}
+	// new work exists: wake admission (the quiescence watermark must
+	// never hide a fresh submit)
+	e.setQuietUntil(time.Time{})
 	return j.ID, nil
 }
 
@@ -144,10 +171,14 @@ func (e *engine) EveryPayload(ctx context.Context, topic, spec string, payload [
 		return "", err
 	}
 	due := cs.nextAfter(e.clk.Now())
+	if due.IsZero() {
+		return "", fmt.Errorf("hourglass: cron %q has no occurrence within the search horizon", spec)
+	}
 	j := &Job{Topic: topic, Payload: payload, Due: due, State: Waiting, Cron: spec}
 	if err := e.store.Insert(ctx, j); err != nil {
 		return "", err
 	}
+	e.setQuietUntil(time.Time{})
 	return j.ID, nil
 }
 
@@ -164,6 +195,9 @@ func (e *engine) maybeReschedule(ctx context.Context, id string) {
 		return
 	}
 	next := cs.nextAfter(j.Due)
+	if next.IsZero() {
+		return // no further occurrence within the horizon: recurrence ends
+	}
 	_ = e.transition(ctx, id, Completed, Waiting) // reschedule owns this edge
 	_ = e.store.(*sqliteStore).setDue(ctx, id, next)
 }
@@ -200,7 +234,7 @@ func (e *engine) Get(ctx context.Context, id string) (*Job, error) { return e.st
 // waiting — nothing is lost.
 func (e *engine) step(ctx context.Context) error {
 	now := e.clk.Now()
-	if e.quietUntil.After(now) {
+	if e.quietUntilNow().After(now) {
 		return nil // quiescence watermark: nothing can be due yet
 	}
 	from := now.Add(-e.cfg.misfireHalo)
@@ -212,14 +246,22 @@ func (e *engine) step(ctx context.Context) error {
 	}
 	if len(cands) == 0 {
 		// quiescence: find the earliest pending due and sleep admission
-		// until it enters the window; one read per quiet period
-		minDue, err := e.store.(*sqliteStore).minPendingDue(ctx)
-		if err == nil && minDue.After(now.Add(e.cfg.lookahead)) {
-			e.quietUntil = minDue.Add(-e.cfg.lookahead)
+		// until it enters the window; one read per quiet period. The
+		// wake-up is capped at half the misfire halo: any due that
+		// crosses the lookahead while admission sleeps is still inside
+		// the scan floor when we wake — a job can never fall below the
+		// horizon and get lost (review finding #1).
+		minDue, ok, err := e.store.(*sqliteStore).minPendingDue(ctx)
+		if err == nil && ok && minDue.After(now.Add(e.cfg.lookahead)) {
+			wake := minDue.Add(-e.cfg.lookahead)
+			if cap := now.Add(e.cfg.misfireHalo / 2); wake.After(cap) {
+				wake = cap
+			}
+			e.setQuietUntil(wake)
 		}
 		return nil
 	}
-	e.quietUntil = time.Time{} // window has work: watermark cleared
+	e.setQuietUntil(time.Time{}) // window has work: watermark cleared
 	ids := make([]string, len(cands))
 	for i, c := range cands {
 		ids[i] = c.ID
@@ -304,7 +346,28 @@ func (e *engine) pump(now time.Time) {
 	res := newBatchResult(len(deliver))
 	for i := range deliver {
 		deliver[i].res = res
-		e.dispatch <- deliver[i]
+	}
+	// Non-blocking dispatch: a full dispatch channel must never stall
+	// the tick loop (review finding #2). Overflowing tasks are released
+	// back to waiting — the anti-loss edge — and re-admitted when
+	// workers drain. select on done also makes Close race-free: no send
+	// can outrun close(dispatch).
+	var spill []string
+	for i := range deliver {
+		select {
+		case e.dispatch <- deliver[i]:
+		case <-e.done:
+			spill = append(spill, deliver[i].job.ID)
+		default:
+			spill = append(spill, deliver[i].job.ID)
+		}
+	}
+	if len(spill) > 0 {
+		// tasks that never reached a handler: count them out of the
+		// batch so the flush fires for the delivered remainder
+		res.shrink(len(spill))
+		_ = e.transitionBatch(ctx, Fired, Waiting, spill, now)
+		_ = e.store.(*sqliteStore).attemptForRollback(ctx, spill)
 	}
 	res.setFlush(func(doneIds, deadIds []string, deadErrs map[string]string) {
 		_ = now2
@@ -377,6 +440,14 @@ func newBatchResult(n int) *batchResult {
 	return br
 }
 
+// shrink removes k expected outcomes (tasks spilled back to waiting
+// before dispatch); if nothing remains, flush fires immediately.
+func (r *batchResult) shrink(k int) {
+	if r.pending.Add(-int64(k)) <= 0 {
+		r.flush()
+	}
+}
+
 func (r *batchResult) complete(id string, herr error) {
 	r.mu.Lock()
 	if herr == nil {
@@ -439,9 +510,20 @@ func (e *engine) fireEntry(task wheelTask) {
 	if h == nil {
 		herr = fmt.Errorf("hourglass: no handler for topic %q", j.Topic)
 	} else {
-		herr = h(ctx, j)
+		herr = e.runHandler(ctx, h, j)
 	}
 	task.res.complete(j.ID, herr)
+}
+
+// runHandler contains panics: a panicking handler is an error on that
+// job, never a dead worker or a wedged batch (review finding #4).
+func (e *engine) runHandler(ctx context.Context, h Handler, j Job) (herr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			herr = fmt.Errorf("hourglass: handler for %q panicked: %v", j.Topic, r)
+		}
+	}()
+	return h(ctx, j)
 }
 
 func (e *engine) handlerFor(topic string) Handler {
@@ -484,6 +566,8 @@ func (e *engine) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-e.done:
+			return
 		case now := <-tick.C:
 			e.pump(now)
 			if err := e.step(ctx); err != nil {
@@ -498,8 +582,9 @@ func (e *engine) Run(ctx context.Context) {
 	}
 }
 
-// Close stops the engine: stop ticking, drain in-flight dispatch,
-// release the wheel, wait for handlers.
+// Close stops the engine: signal done (Run and pump stop), close the
+// dispatch channel once no sender can race it, wait for handlers, then
+// release the wheel. Idempotent.
 func (e *engine) Close() error {
 	e.mu.Lock()
 	if e.closed {
@@ -509,7 +594,8 @@ func (e *engine) Close() error {
 	e.closed = true
 	e.mu.Unlock()
 
-	close(e.dispatch) // workers drain the channel then exit
-	e.wg.Wait()
+	close(e.done)     // pump selects on this; Run's loop sees it via ctx or done
+	close(e.dispatch) // safe now: pump's only send path selects on done
+	e.wg.Wait()       // workers drain dispatch then exit
 	return e.wheel.Close()
 }

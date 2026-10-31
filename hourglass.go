@@ -95,6 +95,18 @@ func (h *Handle) Run(ctx context.Context) {
 	h.eng.Run(ctx)
 }
 
+// Cancel revokes a job before its fire moment; the row persists as a
+// receipt. Cancel after fire is rejected.
+func (h *Handle) Cancel(ctx context.Context, id, reason string) error {
+	return h.eng.Cancel(ctx, id, reason)
+}
+
+// Every schedules a recurring job from a standard 5-field cron
+// expression; the same job row reschedules after each completion.
+func (h *Handle) Every(ctx context.Context, topic, spec string) (string, error) {
+	return h.eng.Every(ctx, topic, spec)
+}
+
 // ErrEmptyTopic and ErrMissingDue are submit-time contract violations.
 var (
 	ErrEmptyTopic = errors.New("hourglass: empty topic")
@@ -145,5 +157,12 @@ func (h *Handle) Submit(ctx context.Context, topic string, payload []byte, opts 
 	return h.eng.Submit(ctx, topic, payload, opts...)
 }
 
-// Close releases the store.
-func (h *Handle) Close() error { return h.db.Close() }
+// Close stops the engine (workers, wheel, in-flight flushes) and
+// releases the store.
+func (h *Handle) Close() error {
+	if err := h.eng.Close(); err != nil {
+		h.db.Close()
+		return err
+	}
+	return h.db.Close()
+}

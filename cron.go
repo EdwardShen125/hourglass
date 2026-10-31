@@ -36,17 +36,20 @@ func parseCron(spec string) (*cronSpec, error) {
 		if err != nil {
 			return nil, fmt.Errorf("hourglass: cron %q field %d (%s): %w", spec, i+1, f, err)
 		}
+		// V7 dom|dow OR rule needs "unrestricted", and Vixie cron
+		// treats any leading-'*' field ('*', '*/n') as unrestricted.
+		unrestricted := star || strings.HasPrefix(f, "*")
 		switch i {
 		case 0:
 			out.minute = mask
 		case 1:
 			out.hour = mask
 		case 2:
-			out.dom, out.domStar = mask, star
+			out.dom, out.domStar = mask, unrestricted
 		case 3:
 			out.month = mask
 		case 4:
-			out.dow, out.dowStar = mask, star
+			out.dow, out.dowStar = mask, unrestricted
 		}
 	}
 	return out, nil
@@ -58,18 +61,20 @@ func parseField(f string, lo, hi int) (mask uint64, star bool, err error) {
 	}
 	for _, part := range strings.Split(f, ",") {
 		step := 1
+		hasStep := false
 		if idx := strings.IndexByte(part, '/'); idx >= 0 {
 			s, cerr := strconv.Atoi(part[idx+1:])
 			if cerr != nil || s <= 0 {
 				return 0, false, fmt.Errorf("bad step %q", part[idx+1:])
 			}
 			step = s
+			hasStep = true
 			part = part[:idx]
 		}
 		b, e := lo, hi
 		switch {
 		case part == "*":
-			// */n
+			// */n — full range with step
 		case strings.ContainsRune(part, '-'):
 			parts := strings.SplitN(part, "-", 2)
 			b, err = strconv.Atoi(parts[0])
@@ -85,8 +90,8 @@ func parseField(f string, lo, hi int) (mask uint64, star bool, err error) {
 			if err != nil {
 				return 0, false, fmt.Errorf("bad number %q", part)
 			}
-			if strings.ContainsRune(f, '/') {
-				e = hi // "5/15" = 5,20,35,50
+			if hasStep {
+				e = hi // "5/15" = 5,20,35,50 (step from this value)
 			} else {
 				e = b
 			}
@@ -114,7 +119,9 @@ func fullMask(lo, hi int) uint64 {
 func (c *cronSpec) nextAfter(t time.Time) time.Time {
 	// start at the next whole minute strictly after t
 	n := t.Truncate(time.Minute).Add(time.Minute)
-	limit := n.AddDate(1, 0, 0) // sanity bound: 1 year of search
+	// sanity bound: 5 years of search covers every real spec including
+	// Feb 29; a miss returns zero time and callers reject the spec.
+	limit := n.AddDate(5, 0, 0)
 	for n.Before(limit) {
 		if !c.monthMatches(n) {
 			n = firstOfNextMonth(n)

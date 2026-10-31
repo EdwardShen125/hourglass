@@ -284,6 +284,7 @@ var legalEdges = map[[2]State]bool{
 	{Acquired, Canceled}: true, // wheel mode, before fire
 	{Acquired, Waiting}:  true, // wheel overflow release (anti-loss)
 	{Completed, Waiting}: true, // reschedule: cron next occurrence
+	{Fired, Waiting}:     true, // retry backoff requeue / dispatch spillback / crash recovery
 }
 
 // transition advances state atomically: UPDATE ... WHERE state = from,
@@ -320,6 +321,23 @@ func (s *sqliteStore) transitionBatch(ctx context.Context, from, to State, ids [
 	q := `UPDATE jobs SET state = ?, terminal_at = CASE WHEN ? IN ('completed','dead','canceled') THEN ? ELSE terminal_at END WHERE state = ? AND id IN (` + ph[:len(ph)-1] + `)`
 	args := make([]any, 0, len(ids)+4)
 	args = append(args, string(to), string(to), at.Unix(), string(from))
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	_, err := s.db.ExecContext(ctx, q, args...)
+	return err
+}
+
+// attemptForRollback decrements the attempt counter for tasks released
+// before dispatch (dispatch spillback): they have not run, so the
+// attempt must not count.
+func (s *sqliteStore) attemptForRollback(ctx context.Context, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	ph := strings.Repeat("?,", len(ids))
+	q := `UPDATE jobs SET attempts=attempts-1 WHERE state='waiting' AND id IN (` + ph[:len(ph)-1] + `)`
+	args := make([]any, 0, len(ids))
 	for _, id := range ids {
 		args = append(args, id)
 	}
@@ -414,14 +432,17 @@ func (s *sqliteStore) purgeTerminal(ctx context.Context, now time.Time, ttl time
 
 func (s *sqliteStore) stmtCount() int64 { return s.db.stmts.Load() }
 
-// minPendingDue returns the earliest waiting due; zero when none.
-func (s *sqliteStore) minPendingDue(ctx context.Context) (time.Time, error) {
-	var due int64
-	err := s.db.QueryRowContext(ctx, `SELECT MIN(due) FROM jobs WHERE state='waiting'`).Scan(&due)
-	if err != nil || due == 0 {
-		return time.Time{}, err
+// minPendingDue returns the earliest waiting due and whether any
+// exists. NULL (empty table) is not an error.
+func (s *sqliteStore) minPendingDue(ctx context.Context) (time.Time, bool, error) {
+	var due sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, `SELECT MIN(due) FROM jobs WHERE state='waiting'`).Scan(&due); err != nil {
+		return time.Time{}, false, err
 	}
-	return time.Unix(due, 0).UTC(), nil
+	if !due.Valid || due.Int64 == 0 {
+		return time.Time{}, false, nil
+	}
+	return time.Unix(due.Int64, 0).UTC(), true, nil
 }
 
 // readCount exposes the read counter (quiescence benchmark).
