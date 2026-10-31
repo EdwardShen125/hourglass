@@ -33,17 +33,27 @@ type sqliteStore struct {
 	db *countingDB
 }
 
-// countingDB counts write statements (ExecContext) so tests can assert
-// batching behavior: one tick's fire path must be O(batches) writes,
-// not O(jobs). Reads are not counted — waiting loops poll with SELECTs.
+// countingDB counts statements so tests can assert batching (writes)
+// and quiescence (reads): writes in stmts, reads in reads.
 type countingDB struct {
 	*sql.DB
 	stmts atomic.Int64
+	reads atomic.Int64
 }
 
 func (c *countingDB) ExecContext(ctx context.Context, q string, args ...any) (sql.Result, error) {
 	c.stmts.Add(1)
 	return c.DB.ExecContext(ctx, q, args...)
+}
+
+func (c *countingDB) QueryContext(ctx context.Context, q string, args ...any) (*sql.Rows, error) {
+	c.reads.Add(1)
+	return c.DB.QueryContext(ctx, q, args...)
+}
+
+func (c *countingDB) QueryRowContext(ctx context.Context, q string, args ...any) *sql.Row {
+	c.reads.Add(1)
+	return c.DB.QueryRowContext(ctx, q, args...)
 }
 
 const schema = `
@@ -58,6 +68,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 	attempts INTEGER NOT NULL DEFAULT 0,   -- times fired
 	max_attempts INTEGER NOT NULL DEFAULT 1,
 	backoff  INTEGER NOT NULL DEFAULT 30, -- seconds
+	terminal_at INTEGER NOT NULL DEFAULT 0, -- when the job reached a terminal state (retention clock)
 	cancel_reason TEXT NOT NULL DEFAULT '',
 	epoch    INTEGER NOT NULL DEFAULT 0,
 	created_at INTEGER NOT NULL
@@ -225,7 +236,7 @@ func (s *sqliteStore) attemptFor(ctx context.Context, ids []string) error {
 // row persists as a receipt until retention expires.
 func (s *sqliteStore) cancel(ctx context.Context, id, reason string) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET state='canceled', cancel_reason=? WHERE id=? AND state IN ('waiting','acquired')`, reason, id)
+		`UPDATE jobs SET state='canceled', cancel_reason=?, terminal_at=? WHERE id=? AND state IN ('waiting','acquired')`, reason, time.Now().Unix(), id)
 	if err != nil {
 		return err
 	}
@@ -260,7 +271,9 @@ func (s *sqliteStore) transition(ctx context.Context, id string, from, to State)
 	if !legalEdges[[2]State{from, to}] {
 		return fmt.Errorf("hourglass: illegal edge %s -> %s for %s", from, to, id)
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE jobs SET state = ? WHERE id = ? AND state = ?`, string(to), id, string(from))
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE jobs SET state = ?, terminal_at = CASE WHEN ? IN ('completed','dead','canceled') THEN ? ELSE terminal_at END WHERE id = ? AND state = ?`,
+		string(to), string(to), time.Now().Unix(), id, string(from))
 	if err != nil {
 		return err
 	}
@@ -282,9 +295,9 @@ func (s *sqliteStore) transitionBatch(ctx context.Context, from, to State, ids [
 		return fmt.Errorf("hourglass: illegal edge %s -> %s (batch of %d)", from, to, len(ids))
 	}
 	ph := strings.Repeat("?,", len(ids))
-	q := `UPDATE jobs SET state = ? WHERE state = ? AND id IN (` + ph[:len(ph)-1] + `)`
-	args := make([]any, 0, len(ids)+2)
-	args = append(args, string(to), string(from))
+	q := `UPDATE jobs SET state = ?, terminal_at = CASE WHEN ? IN ('completed','dead','canceled') THEN ? ELSE terminal_at END WHERE state = ? AND id IN (` + ph[:len(ph)-1] + `)`
+	args := make([]any, 0, len(ids)+4)
+	args = append(args, string(to), string(to), at.Unix(), string(from))
 	for _, id := range ids {
 		args = append(args, id)
 	}
@@ -329,7 +342,68 @@ func (s *sqliteStore) getMany(ctx context.Context, ids []string) (map[string]Job
 	return out, nil
 }
 
+// maxSweepPerPass bounds one retention pass: bounded batches, never a
+// giant DELETE (DESIGN.md: never inline with the fire path).
+const maxSweepPerPass = 500
+
+// purgeTerminal deletes up to limit terminal rows older than ttl and
+// their receipts; returns the number of job rows deleted.
+func (s *sqliteStore) purgeTerminal(ctx context.Context, now time.Time, ttl time.Duration, limit int) (int, error) {
+	cutoff := now.Add(-ttl).Unix()
+	// find ids first (receipts need them), bounded
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id FROM jobs WHERE state IN ('completed','dead','canceled') AND terminal_at > 0 AND terminal_at < ? LIMIT ?`,
+		cutoff, limit)
+	if err != nil {
+		return 0, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	ph := strings.Repeat("?,", len(ids))
+	ph = ph[:len(ph)-1]
+	args := make([]any, 0, len(ids))
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM receipts WHERE job_id IN (`+ph+`)`, args...); err != nil {
+		return 0, err
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM jobs WHERE id IN (`+ph+`)`, args...)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
 func (s *sqliteStore) stmtCount() int64 { return s.db.stmts.Load() }
+
+// minPendingDue returns the earliest waiting due; zero when none.
+func (s *sqliteStore) minPendingDue(ctx context.Context) (time.Time, error) {
+	var due int64
+	err := s.db.QueryRowContext(ctx, `SELECT MIN(due) FROM jobs WHERE state='waiting'`).Scan(&due)
+	if err != nil || due == 0 {
+		return time.Time{}, err
+	}
+	return time.Unix(due, 0).UTC(), nil
+}
+
+// readCount exposes the read counter (quiescence benchmark).
+func (s *sqliteStore) readCount() int64 { return s.db.reads.Load() }
 
 func newID() string {
 	b := make([]byte, 16)

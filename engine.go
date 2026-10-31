@@ -20,6 +20,7 @@ type engineConfig struct {
 	admitLimit  int
 	misfireHalo time.Duration // how far back the window floor reaches
 	workers     int           // handler dispatch concurrency
+	retention   time.Duration // terminal-row TTL (default 7d)
 }
 
 func defaultEngineConfig() engineConfig {
@@ -43,6 +44,10 @@ type engine struct {
 	handlers map[string]Handler
 	closed   bool
 
+	// quietUntil: admission sleeps until this moment when the store has
+	// nothing admissible (quiescence watermark).
+	quietUntil time.Time
+
 	// dispatch delivers fired entries to handlers on a worker pool,
 	// outside the wheel lock: one slow handler must not stall ticks,
 	// admission, or cancel.
@@ -62,6 +67,9 @@ func newEngine(s Store, clk clock, cfg engineConfig) *engine {
 	}
 	if cfg.workers <= 0 {
 		cfg.workers = defaultEngineConfig().workers
+	}
+	if cfg.retention <= 0 {
+		cfg.retention = 7 * 24 * time.Hour
 	}
 	e := &engine{
 		store:    s,
@@ -192,6 +200,9 @@ func (e *engine) Get(ctx context.Context, id string) (*Job, error) { return e.st
 // waiting — nothing is lost.
 func (e *engine) step(ctx context.Context) error {
 	now := e.clk.Now()
+	if e.quietUntil.After(now) {
+		return nil // quiescence watermark: nothing can be due yet
+	}
 	from := now.Add(-e.cfg.misfireHalo)
 	to := now.Add(e.cfg.lookahead)
 
@@ -200,8 +211,15 @@ func (e *engine) step(ctx context.Context) error {
 		return fmt.Errorf("admission select: %w", err)
 	}
 	if len(cands) == 0 {
+		// quiescence: find the earliest pending due and sleep admission
+		// until it enters the window; one read per quiet period
+		minDue, err := e.store.(*sqliteStore).minPendingDue(ctx)
+		if err == nil && minDue.After(now.Add(e.cfg.lookahead)) {
+			e.quietUntil = minDue.Add(-e.cfg.lookahead)
+		}
 		return nil
 	}
+	e.quietUntil = time.Time{} // window has work: watermark cleared
 	ids := make([]string, len(cands))
 	for i, c := range cands {
 		ids[i] = c.ID
@@ -446,11 +464,22 @@ func (e *engine) transitionBatch(ctx context.Context, from, to State, ids []stri
 // stmtCount exposes the store's statement counter (tests only).
 func (e *engine) stmtCount() int64 { return e.store.(*sqliteStore).stmtCount() }
 
+// readCount exposes the store's read counter (benchmarks only).
+func (e *engine) readCount() int64 { return e.store.(*sqliteStore).readCount() }
+
+// sweep runs one retention pass: terminal rows past the TTL leave in
+// bounded batches. Never inline with the fire path.
+func (e *engine) sweep(ctx context.Context, now time.Time) (int, error) {
+	return e.store.(*sqliteStore).purgeTerminal(ctx, now, e.cfg.retention, maxSweepPerPass)
+}
+
 // Run drives admission and wheel ticks on a one-second cadence until
 // ctx is done.
 func (e *engine) Run(ctx context.Context) {
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
+	sweepEvery := 10 * time.Minute
+	nextSweep := time.Now().Add(sweepEvery)
 	for {
 		select {
 		case <-ctx.Done():
@@ -460,6 +489,10 @@ func (e *engine) Run(ctx context.Context) {
 			if err := e.step(ctx); err != nil {
 				// admission errors are survivable: next tick retries
 				continue
+			}
+			if now.After(nextSweep) {
+				nextSweep = now.Add(sweepEvery)
+				_, _ = e.sweep(ctx, now)
 			}
 		}
 	}
