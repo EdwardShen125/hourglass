@@ -33,13 +33,51 @@ CREATE TABLE IF NOT EXISTS receipts (
 CREATE INDEX IF NOT EXISTS idx_receipts_job ON receipts(job_id, at);
 `
 
-func (s *sqliteStore) addReceipt(ctx context.Context, jobID, kind, errText, reason, state string, at time.Time) error {
-	return s.addReceiptBatch(ctx, []string{jobID}, kind, errText, reason, state, at)
+// addReceiptSingle writes one receipt row (cancel path).
+func (s *sqliteStore) addReceiptSingle(ctx context.Context, jobID, kind, errText, reason, state string, at time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO receipts (id, job_id, kind, attempt, error, reason, at, state) VALUES (?, ?, ?, 1, ?, ?, ?, ?)`,
+		newID(), jobID, kind, errText, reason, at.Unix(), state)
+	return err
+}
+
+// addReceiptAttempt writes per-job receipts with per-job attempt
+// numbers (one multi-VALUES insert; attempt varies per row).
+func (s *sqliteStore) addReceiptAttempt(ctx context.Context, ids []string, jobs map[string]Job, kind string, at time.Time) error {
+	return s.addReceiptAttemptErr(ctx, ids, jobs, kind, "", at)
+}
+
+// addReceiptAttemptErr is addReceiptAttempt with an error text.
+func (s *sqliteStore) addReceiptAttemptErr(ctx context.Context, ids []string, jobs map[string]Job, kind, errText string, at time.Time) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	state := kind
+	if kind == "retry" {
+		state = "waiting"
+	}
+	var sb strings.Builder
+	sb.WriteString(`INSERT INTO receipts (id, job_id, kind, attempt, error, reason, at, state) VALUES `)
+	args := make([]any, 0, len(ids)*8)
+	for i, id := range ids {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		att := 1
+		if j, ok := jobs[id]; ok {
+			att = j.Attempts
+		}
+		sb.WriteString("(?, ?, ?, ?, ?, '', ?, ?)")
+		args = append(args, newID(), id, kind, att, errText, at.Unix(), state)
+	}
+	_, err := s.db.ExecContext(ctx, sb.String(), args...)
+	return err
 }
 
 // addReceiptBatch writes one receipt per job in a single multi-VALUES
-// INSERT: the hot minute must not be a receipt write storm.
-func (s *sqliteStore) addReceiptBatch(ctx context.Context, jobIDs []string, kind, errText, reason, state string, at time.Time) error {
+// INSERT: the hot minute must not be a receipt write storm. attempt is
+// the job's current attempt number.
+func (s *sqliteStore) addReceiptBatch(ctx context.Context, jobIDs []string, kind, errText, reason, state string, at time.Time, attempt int) error {
 	if len(jobIDs) == 0 {
 		return nil
 	}
@@ -50,8 +88,8 @@ func (s *sqliteStore) addReceiptBatch(ctx context.Context, jobIDs []string, kind
 		if i > 0 {
 			sb.WriteByte(',')
 		}
-		sb.WriteString("(?, ?, ?, 1, ?, ?, ?, ?)")
-		args = append(args, newID(), jobID, kind, errText, reason, at.Unix(), state)
+		sb.WriteString("(?, ?, ?, ?, ?, ?, ?, ?)")
+		args = append(args, newID(), jobID, kind, attempt, errText, reason, at.Unix(), state)
 	}
 	_, err := s.db.ExecContext(ctx, sb.String(), args...)
 	return err

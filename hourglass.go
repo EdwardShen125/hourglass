@@ -47,6 +47,10 @@ type Job struct {
 	// ScheduledAt is the pre-jitter time; Due is what the wheel obeys.
 	ScheduledAt time.Time
 
+	Attempts    int           // fires so far (including the current one)
+	MaxAttempts int           // 1 = no retries; exhausted -> dead
+	Backoff     time.Duration // delay before the next attempt
+
 	CancelReason string // set when State == canceled
 }
 
@@ -101,9 +105,11 @@ var (
 type SubmitOption func(*submitConfig)
 
 type submitConfig struct {
-	due    time.Time
-	hasDue bool
-	jitter time.Duration
+	due         time.Time
+	hasDue      bool
+	jitter      time.Duration
+	maxAttempts int
+	backoff     time.Duration
 }
 
 // At schedules the job at an exact time.
@@ -120,6 +126,18 @@ func Delay(d time.Duration) SubmitOption {
 // stored: hot minutes melt before they form (DESIGN.md). Default zero.
 func Jitter(w time.Duration) SubmitOption {
 	return func(c *submitConfig) { c.jitter = w }
+}
+
+// Retries sets additional attempts after the first failure.
+// Retries(2) = 3 total attempts. Default 0 (single attempt).
+func Retries(n int) SubmitOption {
+	return func(c *submitConfig) { c.maxAttempts = 1 + n }
+}
+
+// RetryBackoff sets the delay before a failed attempt refires.
+// Default 30s. The delay is constant; exponential growth is a v1.x knob.
+func RetryBackoff(d time.Duration) SubmitOption {
+	return func(c *submitConfig) { c.backoff = d }
 }
 
 // Submit persists a job and returns its id.

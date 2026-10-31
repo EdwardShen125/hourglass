@@ -100,19 +100,28 @@ func (w *wheel) Offer(e wheelEntry) error {
 // insert places an entry at the lowest level whose horizon covers it.
 // Past-due entries go to the ready queue instead — bucket indexes in
 // the past are never revisited. Caller holds w.mu.
+//
+// Cascade rule: if the chosen level's bucket index is at or before the
+// wheel's current index at that level, the bucket is "current" and will
+// not be revisited by the next scan — the entry must go one level lower
+// (ultimately level 0, the second grid, which the tick always scans).
+// Without this, an entry cascaded into its own current bucket (e.g. due
+// t0+65 landing in the t0+60..t0+119 L1 bucket during a jump tick) is
+// never collected: the next tick's prevIdx has already passed it.
 func (w *wheel) insert(e *wheelEntry) {
 	remaining := e.due.Unix() - w.now.Unix()
 	if remaining <= 0 {
 		w.ready = append(w.ready, e)
 		return
 	}
-	for _, lvl := range w.levels {
+	for li, lvl := range w.levels {
 		interval := lvl.unit * wheelSize
-		if remaining < interval {
-			idx := e.due.Unix() / lvl.unit
+		idx := e.due.Unix() / lvl.unit
+		if remaining < interval && idx > w.now.Unix()/lvl.unit {
 			lvl.buckets[idx] = append(lvl.buckets[idx], e)
 			return
 		}
+		_ = li
 	}
 	// Beyond the top level's horizon: park in the last level's farthest
 	// bucket; cascades will bring it down. Horizon is years; unreachable
@@ -158,8 +167,11 @@ func (w *wheel) Tick(now time.Time) []wheelEntry {
 	if !now.After(w.now) {
 		return due
 	}
+	prevNow := w.now
+	w.now = now // cascades must see the NEW now, or they re-land in the
+	// very bucket the scan just emptied (stale-idx bug)
 	for _, lvl := range w.levels {
-		prevIdx := w.now.Unix() / lvl.unit
+		prevIdx := prevNow.Unix() / lvl.unit
 		curIdx := now.Unix() / lvl.unit
 		for idx := prevIdx + 1; idx <= curIdx; idx++ {
 			batch := lvl.buckets[idx]
@@ -170,7 +182,6 @@ func (w *wheel) Tick(now time.Time) []wheelEntry {
 			due = append(due, w.collectBatch(batch, now)...)
 		}
 	}
-	w.now = now
 	return due
 }
 

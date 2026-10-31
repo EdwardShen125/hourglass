@@ -108,9 +108,13 @@ func (e *engine) Submit(ctx context.Context, topic string, payload []byte, opts 
 	if !c.hasDue {
 		return "", ErrMissingDue
 	}
-	j := &Job{Topic: topic, Payload: payload, Due: c.due, ScheduledAt: c.due, State: Waiting}
+	j := &Job{Topic: topic, Payload: payload, Due: c.due, ScheduledAt: c.due, State: Waiting,
+		Attempts: 0, MaxAttempts: max(c.maxAttempts, 1), Backoff: c.backoff}
 	if c.jitter > 0 {
 		j.Due = j.Due.Add(drawJitter(c.jitter, time.Now().UnixNano()))
+	}
+	if j.Backoff == 0 {
+		j.Backoff = 30 * time.Second
 	}
 	if err := e.store.Insert(ctx, j); err != nil {
 		return "", err
@@ -173,7 +177,7 @@ func (e *engine) Cancel(ctx context.Context, id, reason string) error {
 		if err := e.store.(*sqliteStore).cancel(ctx, id, reason); err != nil {
 			return err
 		}
-		return e.store.(*sqliteStore).addReceipt(ctx, id, "canceled", "", reason, "canceled", e.clk.Now())
+		return e.store.(*sqliteStore).addReceiptSingle(ctx, id, "canceled", "", reason, "canceled", e.clk.Now())
 	case Fired, Completed, Dead, Canceled:
 		return fmt.Errorf("hourglass: job %s already %s; cancel only wins before fire", id, j.State)
 	}
@@ -249,7 +253,7 @@ func (e *engine) pump(now time.Time) {
 	if err := e.transitionBatch(ctx, Acquired, Fired, ids, now); err != nil {
 		return
 	}
-	_ = e.store.(*sqliteStore).addReceiptBatch(ctx, ids, "fired", "", "", "fired", now)
+	_ = e.store.(*sqliteStore).attemptFor(ctx, ids) // attempts+1, batched
 
 	// one re-read for the whole batch: handlers get their job row without
 	// a per-job Get
@@ -257,16 +261,24 @@ func (e *engine) pump(now time.Time) {
 	if err != nil {
 		return
 	}
+	now2 := now
 	// filter raced-away rows (canceled between transition and re-read)
 	// BEFORE arming the collector: the expected count must be exact or
 	// the flush never fires
+	firedIDs := make([]string, 0, len(batch))
 	deliver := make([]wheelTask, 0, len(batch))
 	for _, entry := range batch {
 		j, ok := jobs[entry.id]
 		if !ok || j.State != Fired {
 			continue // never handed to a handler: no delivery, no death
 		}
+		firedIDs = append(firedIDs, j.ID)
 		deliver = append(deliver, wheelTask{job: j})
+	}
+	if len(firedIDs) > 0 {
+		// one receipt per fired job with per-job attempt numbers (one
+		// multi-VALUES insert); rows re-read after the attempt bump
+		_ = e.store.(*sqliteStore).addReceiptAttempt(ctx, firedIDs, jobs, "fired", now)
 	}
 	if len(deliver) == 0 {
 		return
@@ -277,23 +289,54 @@ func (e *engine) pump(now time.Time) {
 		e.dispatch <- deliver[i]
 	}
 	res.setFlush(func(doneIds, deadIds []string, deadErrs map[string]string) {
+		_ = now2
 		if len(doneIds) > 0 {
-			_ = e.transitionBatch(ctx, Fired, Completed, doneIds, now)
-			_ = e.store.(*sqliteStore).addReceiptBatch(ctx, doneIds, "completed", "", "", "completed", now)
+			_ = e.transitionBatch(ctx, Fired, Completed, doneIds, now2)
+			_ = e.store.(*sqliteStore).addReceiptAttempt(ctx, doneIds, jobs, "completed", now2)
 			for _, id := range doneIds {
 				e.maybeReschedule(ctx, id)
 			}
 		}
 		if len(deadIds) > 0 {
-			_ = e.transitionBatch(ctx, Fired, Dead, deadIds, now)
-			// dead receipts carry the handler error; one per job in a
-			// single statement per distinct error text
+			// split: exhausted -> dead; has-attempts-left -> retry with
+			// backoff (fired -> waiting)
+			var exhausted, retry []string
+			for _, id := range deadIds {
+				j, ok := jobs[id]
+				if ok && j.Attempts < j.MaxAttempts {
+					retry = append(retry, id)
+				} else {
+					exhausted = append(exhausted, id)
+				}
+			}
+			if len(exhausted) > 0 {
+				_ = e.transitionBatch(ctx, Fired, Dead, exhausted, now2)
+			}
+			if len(retry) > 0 {
+				for _, id := range retry {
+					_ = e.store.(*sqliteStore).retryFor(ctx, id, now2, jobs[id].Backoff)
+				}
+			}
+			// receipts: dead or retry kind, grouped by error text
 			byErr := make(map[string][]string)
 			for id, txt := range deadErrs {
 				byErr[txt] = append(byErr[txt], id)
 			}
 			for txt, group := range byErr {
-				_ = e.store.(*sqliteStore).addReceiptBatch(ctx, group, "dead", txt, "", "dead", now)
+				var deadGroup, retryGroup []string
+				for _, id := range group {
+					if j, ok := jobs[id]; ok && j.Attempts < j.MaxAttempts {
+						retryGroup = append(retryGroup, id)
+					} else {
+						deadGroup = append(deadGroup, id)
+					}
+				}
+				if len(deadGroup) > 0 {
+					_ = e.store.(*sqliteStore).addReceiptAttemptErr(ctx, deadGroup, jobs, "dead", txt, now2)
+				}
+				if len(retryGroup) > 0 {
+					_ = e.store.(*sqliteStore).addReceiptAttemptErr(ctx, retryGroup, jobs, "retry", txt, now2)
+				}
 			}
 		}
 	})
