@@ -18,6 +18,7 @@ type engineConfig struct {
 	lookahead   time.Duration
 	admitLimit  int
 	misfireHalo time.Duration // how far back the window floor reaches
+	workers     int           // handler dispatch concurrency
 }
 
 func defaultEngineConfig() engineConfig {
@@ -25,6 +26,7 @@ func defaultEngineConfig() engineConfig {
 		lookahead:   30 * time.Minute,
 		admitLimit:  1000,
 		misfireHalo: 10 * time.Minute,
+		workers:     8,
 	}
 }
 
@@ -39,6 +41,12 @@ type engine struct {
 	mu       sync.Mutex
 	handlers map[string]Handler
 	closed   bool
+
+	// dispatch delivers fired entries to handlers on a worker pool,
+	// outside the wheel lock: one slow handler must not stall ticks,
+	// admission, or cancel.
+	dispatch chan wheelEntry
+	wg       sync.WaitGroup
 }
 
 func newEngine(s Store, clk clock, cfg engineConfig) *engine {
@@ -51,15 +59,33 @@ func newEngine(s Store, clk clock, cfg engineConfig) *engine {
 	if cfg.misfireHalo <= 0 {
 		cfg.misfireHalo = defaultEngineConfig().misfireHalo
 	}
+	if cfg.workers <= 0 {
+		cfg.workers = defaultEngineConfig().workers
+	}
 	e := &engine{
 		store:    s,
 		clk:      clk,
 		cfg:      cfg,
 		epoch:    1,
 		handlers: make(map[string]Handler),
+		dispatch: make(chan wheelEntry, 1024),
 	}
-	e.wheel = newWheel(clk, e.epoch, e.fireEntry)
+	e.wheel = newWheel(clk, e.epoch)
+	e.startWorkers()
 	return e
+}
+
+// startWorkers launches the handler pool.
+func (e *engine) startWorkers() {
+	for i := 0; i < e.cfg.workers; i++ {
+		e.wg.Add(1)
+		go func() {
+			defer e.wg.Done()
+			for entry := range e.dispatch {
+				e.fireEntry(entry)
+			}
+		}()
+	}
 }
 
 // Register binds a handler to a topic.
@@ -69,8 +95,7 @@ func (e *engine) Register(topic string, h Handler) {
 	e.handlers[topic] = h
 }
 
-// Submit and Get are exposed on the engine for tests; the public Handle
-// delegates to them.
+// Submit persists a job and returns its id.
 func (e *engine) Submit(ctx context.Context, topic string, payload []byte, opts ...SubmitOption) (string, error) {
 	var c submitConfig
 	for _, opt := range opts {
@@ -82,13 +107,79 @@ func (e *engine) Submit(ctx context.Context, topic string, payload []byte, opts 
 	if !c.hasDue {
 		return "", ErrMissingDue
 	}
-	j := &Job{Topic: topic, Payload: payload, Due: c.due, State: Waiting}
+	j := &Job{Topic: topic, Payload: payload, Due: c.due, ScheduledAt: c.due, State: Waiting}
+	if c.jitter > 0 {
+		j.Due = j.Due.Add(drawJitter(c.jitter, time.Now().UnixNano()))
+	}
 	if err := e.store.Insert(ctx, j); err != nil {
 		return "", err
 	}
 	return j.ID, nil
 }
 
+// Every schedules a recurring job from a standard 5-field cron
+// expression. The same job row reschedules after each completion
+// (completed -> waiting with the next occurrence).
+func (e *engine) Every(ctx context.Context, topic, spec string) (string, error) {
+	return e.EveryPayload(ctx, topic, spec, nil)
+}
+
+// EveryPayload is Every with a payload.
+func (e *engine) EveryPayload(ctx context.Context, topic, spec string, payload []byte) (string, error) {
+	cs, err := parseCron(spec)
+	if err != nil {
+		return "", err
+	}
+	due := cs.nextAfter(e.clk.Now())
+	j := &Job{Topic: topic, Payload: payload, Due: due, State: Waiting, Cron: spec}
+	if err := e.store.Insert(ctx, j); err != nil {
+		return "", err
+	}
+	return j.ID, nil
+}
+
+// maybeReschedule advances a completed cron job to its next occurrence:
+// the completed -> waiting edge, one edge, two callers (cron next or a
+// future reschedule_at ack).
+func (e *engine) maybeReschedule(ctx context.Context, id string) {
+	j, err := e.store.Get(ctx, id)
+	if err != nil || j.Cron == "" {
+		return
+	}
+	cs, err := parseCron(j.Cron)
+	if err != nil {
+		return
+	}
+	next := cs.nextAfter(j.Due)
+	_ = e.transition(ctx, id, Completed, Waiting) // reschedule owns this edge
+	_ = e.store.(*sqliteStore).setDue(ctx, id, next)
+}
+
+// Cancel revokes a job: waiting/acquired rows flip to canceled (a
+// receipt — "was planned, was revoked"); admitted-but-unfired wheel
+// entries are marked and skipped at fire time. Cancel after fire is
+// rejected: there is no cancellation promise past the fire moment.
+func (e *engine) Cancel(ctx context.Context, id, reason string) error {
+	j, err := e.store.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	switch j.State {
+	case Waiting, Acquired:
+		// wheel mark first (no-op if not admitted): a late mark is
+		// harmless, a missed mark is a delivery
+		e.wheel.Cancel(id)
+		if err := e.store.(*sqliteStore).cancel(ctx, id, reason); err != nil {
+			return err
+		}
+		return e.store.(*sqliteStore).addReceipt(ctx, id, "canceled", "", reason, "canceled", e.clk.Now())
+	case Fired, Completed, Dead, Canceled:
+		return fmt.Errorf("hourglass: job %s already %s; cancel only wins before fire", id, j.State)
+	}
+	return fmt.Errorf("hourglass: job %s unknown state %s", id, j.State)
+}
+
+// Get fetches one job by id.
 func (e *engine) Get(ctx context.Context, id string) (*Job, error) { return e.store.Get(ctx, id) }
 
 // step runs one admission tick: select the window, CAS-acquire, hand
@@ -126,36 +217,34 @@ func (e *engine) step(ctx context.Context) error {
 }
 
 // release returns wheel-rejected ids to waiting so the next admission
-// pass picks them up again.
+// pass picks them up again. Acquired -> waiting is the anti-loss edge
+// for a full wheel.
 func (e *engine) release(ctx context.Context, ids []string) error {
-	if len(ids) == 0 {
-		return nil
-	}
-	// v1 minimal: direct release. TODO: store.Release(ctx, ids).
 	for _, id := range ids {
-		j, err := e.store.Get(ctx, id)
-		if err != nil {
+		if err := e.transition(ctx, id, Acquired, Waiting); err != nil {
 			return err
 		}
-		j.State = Waiting
-		if err := e.store.(*sqliteStore).setState(ctx, id, Waiting); err != nil {
-			return err
-		}
-		_ = j
 	}
 	return nil
 }
 
-// pump advances the wheel to now and runs what fires.
-func (e *engine) pump(now time.Time) { e.wheel.Tick(now) }
-
-// fireEntry is the wheel's fire callback: state to fired, run handler,
-// complete or dead-letter.
-func (e *engine) fireEntry(entry wheelEntry, at time.Time) {
-	ctx := context.Background()
-	if err := e.transition(ctx, entry.id, Fired); err != nil {
-		return // job vanished (canceled meanwhile) — skip
+// pump advances the wheel to now and dispatches what fires to the
+// worker pool (handlers never run under the wheel lock).
+func (e *engine) pump(now time.Time) {
+	for _, entry := range e.wheel.Tick(now) {
+		e.dispatch <- entry
 	}
+}
+
+// fireEntry is the dispatch path: CAS to fired, run handler, complete
+// or dead-letter, reschedule cron jobs.
+func (e *engine) fireEntry(entry wheelEntry) {
+	ctx := context.Background()
+	now := e.clk.Now()
+	if err := e.transition(ctx, entry.id, Acquired, Fired); err != nil {
+		return // canceled meanwhile or lost race — skip delivery
+	}
+	_ = e.store.(*sqliteStore).addReceipt(ctx, entry.id, "fired", "", "", "fired", now)
 	j, err := e.store.Get(ctx, entry.id)
 	if err != nil {
 		return
@@ -171,7 +260,15 @@ func (e *engine) fireEntry(entry wheelEntry, at time.Time) {
 	if herr != nil {
 		next = Dead // v1: single attempt; retry policy is a v1.0 item
 	}
-	_ = e.transition(ctx, entry.id, next)
+	_ = e.transition(ctx, entry.id, Fired, next)
+	kind, errText := "completed", ""
+	if next == Dead {
+		kind, errText = "dead", herr.Error()
+	}
+	_ = e.store.(*sqliteStore).addReceipt(ctx, entry.id, kind, errText, "", string(next), e.clk.Now())
+	if next == Completed {
+		e.maybeReschedule(ctx, entry.id)
+	}
 }
 
 func (e *engine) handlerFor(topic string) Handler {
@@ -180,15 +277,10 @@ func (e *engine) handlerFor(topic string) Handler {
 	return e.handlers[topic]
 }
 
-// transition advances a job's state if the row is still in from-state.
-// v1 minimal: read-modify-write on the single-writer SQLite store.
-func (e *engine) transition(ctx context.Context, id string, to State) error {
-	j, err := e.store.Get(ctx, id)
-	if err != nil {
-		return err
-	}
-	j.State = to
-	return e.store.(*sqliteStore).setState(ctx, id, to)
+// transition advances a job's state atomically: UPDATE ... WHERE
+// state = from. Illegal edges and lost races fail cleanly.
+func (e *engine) transition(ctx context.Context, id string, from, to State) error {
+	return e.store.(*sqliteStore).transition(ctx, id, from, to)
 }
 
 // Run drives admission and wheel ticks on a one-second cadence until
@@ -210,10 +302,18 @@ func (e *engine) Run(ctx context.Context) {
 	}
 }
 
-// Close stops the engine. Graceful drain is a later cycle.
+// Close stops the engine: stop ticking, drain in-flight dispatch,
+// release the wheel, wait for handlers.
 func (e *engine) Close() error {
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	if e.closed {
+		e.mu.Unlock()
+		return nil
+	}
 	e.closed = true
+	e.mu.Unlock()
+
+	close(e.dispatch) // workers drain the channel then exit
+	e.wg.Wait()
 	return e.wheel.Close()
 }

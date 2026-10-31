@@ -27,9 +27,6 @@ type wheelEntry struct {
 	canceled bool
 }
 
-// fireFunc delivers one entry at the appointed second.
-type fireFunc func(e wheelEntry, at time.Time)
-
 // wheel is a hierarchical timing wheel: 60 slots per level, level L
 // covering 60^L-second spans. Insert O(1); advancement processes only
 // the buckets actually passed — O(1) amortized per tick. Entries due
@@ -48,7 +45,6 @@ type wheel struct {
 	size     int
 	now      time.Time
 	closed   bool
-	fire     fireFunc
 	index    map[string]*wheelEntry
 	levels   []*wheelLevel
 	// ready holds entries whose due is at or before the wheel's current
@@ -67,13 +63,12 @@ type wheelLevel struct {
 
 var wheelSize int64 = 60
 
-func newWheel(clk clock, epoch uint64, fire fireFunc) *wheel {
+func newWheel(clk clock, epoch uint64) *wheel {
 	w := &wheel{
 		clk:      clk,
 		epoch:    epoch,
 		capacity: 1 << 20,
 		index:    make(map[string]*wheelEntry),
-		fire:     fire,
 		now:      clk.Now().Truncate(time.Second),
 	}
 	unit := int64(1)
@@ -140,25 +135,28 @@ func (w *wheel) Cancel(id string) bool {
 	return false
 }
 
-// Tick advances the wheel to now, firing everything due. Entries whose
-// epoch no longer matches the wheel's epoch are dropped (zombie
+// Tick advances the wheel to now, returning the entries to fire.
+// Handlers run OUTSIDE the wheel lock (caller dispatches the returned
+// slice), so a slow handler never stalls admission or cancel. Entries
+// whose epoch no longer matches the wheel's epoch are dropped (zombie
 // fencing); entries in passed buckets but still due later cascade down.
-func (w *wheel) Tick(now time.Time) {
+func (w *wheel) Tick(now time.Time) []wheelEntry {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	now = now.Truncate(time.Second)
 	if now.Before(w.now) {
-		return
+		return nil
 	}
+	var due []wheelEntry
 	// ready fires first: misfires and same-second admissions must not
 	// wait for the clock to move.
 	if len(w.ready) > 0 {
 		batch := w.ready
 		w.ready = nil
-		w.processBatch(batch, now)
+		due = append(due, w.collectBatch(batch, now)...)
 	}
 	if !now.After(w.now) {
-		return
+		return due
 	}
 	for _, lvl := range w.levels {
 		prevIdx := w.now.Unix() / lvl.unit
@@ -169,15 +167,19 @@ func (w *wheel) Tick(now time.Time) {
 				continue
 			}
 			delete(lvl.buckets, idx)
-			w.processBatch(batch, now)
+			due = append(due, w.collectBatch(batch, now)...)
 		}
 	}
 	w.now = now
+	return due
 }
 
-// processBatch handles one bucket batch: epoch check first (per batch,
-// before firing), then fire-or-cascade per entry. Caller holds w.mu.
-func (w *wheel) processBatch(batch []*wheelEntry, now time.Time) {
+// collectBatch filters one bucket batch: epoch check first (per batch,
+// before firing), returning entries due now; still-future entries
+// cascade down. Caller holds w.mu and dispatches the returns outside
+// the lock.
+func (w *wheel) collectBatch(batch []*wheelEntry, now time.Time) []wheelEntry {
+	var due []wheelEntry
 	for _, e := range batch {
 		switch {
 		case e.canceled:
@@ -187,11 +189,12 @@ func (w *wheel) processBatch(batch []*wheelEntry, now time.Time) {
 			w.retire(e)
 		case e.due.Unix() <= now.Unix():
 			w.retire(e)
-			w.fire(*e, now)
+			due = append(due, *e)
 		default:
 			w.insert(e) // cascade: due is nearer now, lands at a lower level
 		}
 	}
+	return due
 }
 
 // retire removes an entry from the live index. Caller holds w.mu.

@@ -3,6 +3,7 @@ package hourglass
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -45,6 +46,7 @@ func TestEngineFiresHandlerAtDueSecond(t *testing.T) {
 
 	// time passes; wheel ticks fire it exactly at due
 	e.pump(clk.Now().Add(30 * time.Second))
+	waitJobState(t, e, id, Completed)
 
 	mu.Lock()
 	at, ok := firedAt[id]
@@ -52,10 +54,7 @@ func TestEngineFiresHandlerAtDueSecond(t *testing.T) {
 	if !ok {
 		t.Fatal("handler never fired")
 	}
-	if !at.Equal(clk.Now().Add(30 * time.Second)) {
-		// note: fake clock was advanced before pump, so Now() is already t0+30s
-		t.Logf("fired at %v", at)
-	}
+	_ = at // fire-moment precision is asserted by wheel tests with the fake clock
 
 	j, err := e.Get(ctx, id)
 	if err != nil {
@@ -97,8 +96,8 @@ func TestEngineMisfireRescanFiresLateJob(t *testing.T) {
 	e, clk := newTestEngine(t)
 	ctx := context.Background()
 
-	var fired bool
-	e.Register("late", func(context.Context, Job) error { fired = true; return nil })
+	var fired atomic.Bool
+	e.Register("late", func(context.Context, Job) error { fired.Store(true); return nil })
 
 	_, err := e.Submit(ctx, "late", nil, At(clk.Now().Add(-2*time.Minute)))
 	if err != nil {
@@ -108,7 +107,11 @@ func TestEngineMisfireRescanFiresLateJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.pump(clk.Now())
-	if !fired {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !fired.Load() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !fired.Load() {
 		t.Fatal("misfired job was never fired")
 	}
 }
@@ -129,6 +132,7 @@ func TestEngineFailedHandlerDeadLetters(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.pump(clk.Now().Add(5 * time.Second))
+	waitJobState(t, e, id, Dead)
 
 	j, err := e.Get(ctx, id)
 	if err != nil {
@@ -136,5 +140,17 @@ func TestEngineFailedHandlerDeadLetters(t *testing.T) {
 	}
 	if j.State != Dead {
 		t.Errorf("failed handler: state = %s, want dead (v1 single attempt; retry policy later)", j.State)
+	}
+}
+
+func waitJobState(t *testing.T, e *engine, id string, want State) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		j, err := e.Get(context.Background(), id)
+		if err == nil && j.State == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

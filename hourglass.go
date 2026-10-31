@@ -44,6 +44,11 @@ type Job struct {
 	Payload []byte
 	Due     time.Time
 	State   State
+	Cron    string // non-empty: recurring; reschedules on completion
+	// ScheduledAt is the pre-jitter time; Due is what the wheel obeys.
+	ScheduledAt time.Time
+
+	CancelReason string // set when State == canceled
 }
 
 // Handle is an hourglass engine bound to one store.
@@ -99,6 +104,7 @@ type SubmitOption func(*submitConfig)
 type submitConfig struct {
 	due    time.Time
 	hasDue bool
+	jitter time.Duration
 }
 
 // At schedules the job at an exact time.
@@ -109,6 +115,12 @@ func At(t time.Time) SubmitOption {
 // Delay schedules the job relative to submit time.
 func Delay(d time.Duration) SubmitOption {
 	return func(c *submitConfig) { c.due, c.hasDue = time.Now().Add(d), true }
+}
+
+// Jitter disperses the due time by rand(0, w), drawn once at submit and
+// stored: hot minutes melt before they form (DESIGN.md). Default zero.
+func Jitter(w time.Duration) SubmitOption {
+	return func(c *submitConfig) { c.jitter = w }
 }
 
 // Submit persists a job and returns its id.
