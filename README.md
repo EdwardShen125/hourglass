@@ -207,9 +207,9 @@ quadrantChart
     quadrant-2 "durable, single-plane"
     quadrant-3 "cache-truth, single-plane"
     quadrant-4 "cache-truth, scalable"
-    "asynq": [0.22, 0.25]
-    "river": [0.35, 0.62]
-    "xxl-job": [0.3, 0.55]
+    "asynq": [0.2, 0.28]
+    "river": [0.3, 0.6]
+    "xxl-job": [0.15, 0.5]
     "Temporal": [0.78, 0.88]
     "hourglass": [0.82, 0.85]
 ```
@@ -219,11 +219,14 @@ What happens on the hot path when a job becomes due:
 ```mermaid
 flowchart TB
     subgraph A["asynq"]
-        A1["scheduled zset"] -->|forwarder polls every 5s| A2["live queue"] --> A3["worker"]
+        A1["scheduled zset"] -->|"EVERY server runs its own forwarder
+        (5s default, redundant scans)"| A2["live queue"] --> A3["worker"]
     end
     subgraph R["river"]
-        R1["jobs table"] -->|poll + SKIP LOCKED
-        NOTIFY as doorbell| R2["worker claim"]
+        R0["scheduled rows"] -->|"elected LEADER advances them
+        (scheduler service)"| R1["available rows"]
+        R1 -->|"fetch: NOTIFY doorbell + 1s poll
+        SKIP LOCKED claims"| R2["worker"]
     end
     subgraph X["xxl-job"]
         X1["central dispatcher"] -->|serializes on one table| X2["trigger"] --> X3["executor"]
@@ -238,18 +241,22 @@ flowchart TB
 |              | asynq          | river            | xxl-job        | Temporal         | hourglass          |
 | ------------ | -------------- | ---------------- | -------------- | ---------------- | ------------------ |
 | truth        | Redis zset     | PG rows          | SQL + logs     | sharded history  | SQL rows + receipts|
-| precision    | poll interval  | poll interval    | dispatch loop  | per-shard timer  | time wheel         |
-| scale-out    | execution only | execution only   | dispatcher-bound | shards (fixed) | shards (movable)   |
-| audit        | —              | rows             | logs           | event history    | receipts (SQL)     |
-| cancel       | admission-time | claim-time       | manual         | workflow-level   | until fire moment  |
+| precision    | 5s forwarder   | ~1s (leader scheduler + fetch) | dispatch loop | per-shard timer | time wheel (0ms p50 @ 1s tick) |
+| scheduling plane | every server (redundant forwarders) | elected leader | central dispatcher (SPOF) | shard owners | shard owners |
+| scale-out    | execution only | execution only   | dispatcher-bound | shards (fixed at boot) | shards (movable, no data moves) |
+| cron durability | scheduler process memory | leader memory — may skip on election (durable = Pro) | DB rows | event history | job row (completed → waiting) |
+| cancel       | until claimed  | even while running (cooperative) | manual | workflow-level | until fire moment (epoch-fenced) |
 | dependency   | Redis          | PostgreSQL       | DB + central   | 4 services + DB  | the SQL you run    |
 
 One line each, honestly:
 
-- **asynq** — great Redis-backed queue with a UI; delayed precision is
-  a poller's interval and the audit trail is Redis.
+- **asynq** — great Redis-backed queue with a UI; every server runs its
+  own 5s forwarder over the scheduled zset, and the audit trail is Redis.
 - **river** — great Postgres-native queue; transactional enqueue is a
-  genuinely nice property; scheduling stays one serialized table.
+  genuinely nice property, and in-flight cancellation works. But the
+  scheduling plane is one elected leader (scheduled jobs stall until a
+  new leader; periodic jobs live in leader memory and can skip —
+  durable periodic is a Pro feature).
 - **xxl-job** — battle-tested console; a central dispatcher on one
   table is the bottleneck the ancestor system replaced in production.
 - **Temporal** — durable workflows with replay; four services and a
