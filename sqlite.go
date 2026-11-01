@@ -244,14 +244,23 @@ func (s *sqliteStore) attemptFor(ctx context.Context, ids []string) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	ph := strings.Repeat("?,", len(ids))
-	q := `UPDATE jobs SET attempts=attempts+1 WHERE state='fired' AND id IN (` + ph[:len(ph)-1] + `)`
-	args := make([]any, 0, len(ids))
-	for _, id := range ids {
-		args = append(args, id)
+	const q = `UPDATE jobs SET attempts=attempts+1 WHERE state='fired' AND id IN (`
+	for off := 0; off < len(ids); off += sqlChunk {
+		end := off + sqlChunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		part := ids[off:end]
+		ph := strings.Repeat("?,", len(part))
+		args := make([]any, 0, len(part))
+		for _, id := range part {
+			args = append(args, id)
+		}
+		if _, err := s.db.ExecContext(ctx, q+ph[:len(ph)-1]+`)`, args...); err != nil {
+			return err
+		}
 	}
-	_, err := s.db.ExecContext(ctx, q, args...)
-	return err
+	return nil
 }
 
 // cancel flips a waiting/acquired row to canceled with a reason; the
@@ -306,10 +315,13 @@ func (s *sqliteStore) transition(ctx context.Context, id string, from, to State)
 	return nil
 }
 
-// transitionBatch advances many rows along one legal edge in a single
-// UPDATE ... WHERE state = from AND id IN (...). Rows not in from are
-// skipped silently (races lose). Returns nothing: the engine treats
-// skipped rows as gone (canceled meanwhile).
+// sqlChunk bounds id-list statements: SQL drivers cap placeholders
+// (SQLite ~32K vars) and packet sizes. 500 keeps every driver happy.
+const sqlChunk = 500
+
+// transitionBatch advances many rows along one legal edge in batched
+// UPDATE ... WHERE state = from AND id IN (...) round-trips (sqlChunk
+// ids each). Rows not in from are skipped silently (races lose).
 func (s *sqliteStore) transitionBatch(ctx context.Context, from, to State, ids []string, at time.Time) error {
 	if len(ids) == 0 {
 		return nil
@@ -317,15 +329,24 @@ func (s *sqliteStore) transitionBatch(ctx context.Context, from, to State, ids [
 	if !legalEdges[[2]State{from, to}] {
 		return fmt.Errorf("hourglass: illegal edge %s -> %s (batch of %d)", from, to, len(ids))
 	}
-	ph := strings.Repeat("?,", len(ids))
-	q := `UPDATE jobs SET state = ?, terminal_at = CASE WHEN ? IN ('completed','dead','canceled') THEN ? ELSE terminal_at END WHERE state = ? AND id IN (` + ph[:len(ph)-1] + `)`
-	args := make([]any, 0, len(ids)+4)
-	args = append(args, string(to), string(to), at.Unix(), string(from))
-	for _, id := range ids {
-		args = append(args, id)
+	const q = `UPDATE jobs SET state = ?, terminal_at = CASE WHEN ? IN ('completed','dead','canceled') THEN ? ELSE terminal_at END WHERE state = ? AND id IN (`
+	for off := 0; off < len(ids); off += sqlChunk {
+		end := off + sqlChunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		part := ids[off:end]
+		ph := strings.Repeat("?,", len(part))
+		args := make([]any, 0, len(part)+4)
+		args = append(args, string(to), string(to), at.Unix(), string(from))
+		for _, id := range part {
+			args = append(args, id)
+		}
+		if _, err := s.db.ExecContext(ctx, q+ph[:len(ph)-1]+`)`, args...); err != nil {
+			return err
+		}
 	}
-	_, err := s.db.ExecContext(ctx, q, args...)
-	return err
+	return nil
 }
 
 // attemptForRollback decrements the attempt counter for tasks released
@@ -335,14 +356,52 @@ func (s *sqliteStore) attemptForRollback(ctx context.Context, ids []string) erro
 	if len(ids) == 0 {
 		return nil
 	}
-	ph := strings.Repeat("?,", len(ids))
-	q := `UPDATE jobs SET attempts=attempts-1 WHERE state='waiting' AND id IN (` + ph[:len(ph)-1] + `)`
-	args := make([]any, 0, len(ids))
-	for _, id := range ids {
-		args = append(args, id)
+	const q = `UPDATE jobs SET attempts=attempts-1 WHERE state='waiting' AND id IN (`
+	for off := 0; off < len(ids); off += sqlChunk {
+		end := off + sqlChunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		part := ids[off:end]
+		ph := strings.Repeat("?,", len(part))
+		args := make([]any, 0, len(part))
+		for _, id := range part {
+			args = append(args, id)
+		}
+		if _, err := s.db.ExecContext(ctx, q+ph[:len(ph)-1]+`)`, args...); err != nil {
+			return err
+		}
 	}
-	_, err := s.db.ExecContext(ctx, q, args...)
-	return err
+	return nil
+}
+
+// seedStorm bulk-inserts n waiting jobs due at the same second (hot-
+// minute benchmark seed; single multi-VALUES insert per 500).
+func (s *sqliteStore) seedStorm(ctx context.Context, n int, due time.Time) error {
+	const chunk = 500
+	var sb strings.Builder
+	args := make([]any, 0, chunk*8)
+	now := time.Now().Unix()
+	for off := 0; off < n; off += chunk {
+		end := off + chunk
+		if end > n {
+			end = n
+		}
+		sb.Reset()
+		sb.WriteString(`INSERT INTO jobs (id, topic, payload, due, sched_at, state, cron, attempts, max_attempts, backoff, created_at) VALUES `)
+		args = args[:0]
+		for i := off; i < end; i++ {
+			if i > off {
+				sb.WriteByte(',')
+			}
+			sb.WriteString("(?, 'storm', NULL, ?, ?, 'waiting', '', 0, 1, 30, ?)")
+			args = append(args, newID(), due.Unix(), due.Unix(), now)
+		}
+		if _, err := s.db.ExecContext(ctx, sb.String(), args...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // listDead lists dead rows newest-first (by terminal_at desc), topic-
@@ -413,29 +472,34 @@ func (s *sqliteStore) listAll(ctx context.Context) ([]Job, error) {
 	return scanJobs(rows)
 }
 
-// getMany fetches job rows by id set in one statement (pump re-read).
+// getMany fetches job rows by id set in batched statements (pump
+// re-read).
 func (s *sqliteStore) getMany(ctx context.Context, ids []string) (map[string]Job, error) {
-	if len(ids) == 0 {
-		return nil, nil
-	}
-	ph := strings.Repeat("?,", len(ids))
-	q := `SELECT id, topic, payload, due, sched_at, state, cron, attempts, max_attempts, backoff, cancel_reason FROM jobs WHERE id IN (` + ph[:len(ph)-1] + `)`
-	args := make([]any, 0, len(ids))
-	for _, id := range ids {
-		args = append(args, id)
-	}
-	rows, err := s.db.QueryContext(ctx, q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	out := make(map[string]Job, len(ids))
-	list, err := scanJobs(rows)
-	if err != nil {
-		return nil, err
-	}
-	for _, j := range list {
-		out[j.ID] = j
+	for off := 0; off < len(ids); off += sqlChunk {
+		end := off + sqlChunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		part := ids[off:end]
+		ph := strings.Repeat("?,", len(part))
+		q := `SELECT id, topic, payload, due, sched_at, state, cron, attempts, max_attempts, backoff, cancel_reason FROM jobs WHERE id IN (` + ph[:len(ph)-1] + `)`
+		args := make([]any, 0, len(part))
+		for _, id := range part {
+			args = append(args, id)
+		}
+		rows, err := s.db.QueryContext(ctx, q, args...)
+		if err != nil {
+			return nil, err
+		}
+		list, err := scanJobs(rows)
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+		for _, j := range list {
+			out[j.ID] = j
+		}
 	}
 	return out, nil
 }

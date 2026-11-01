@@ -56,22 +56,32 @@ func (s *sqliteStore) addReceiptAttemptErr(ctx context.Context, ids []string, jo
 	if kind == "retry" {
 		state = "waiting"
 	}
-	var sb strings.Builder
-	sb.WriteString(`INSERT INTO receipts (id, job_id, kind, attempt, error, reason, at, state) VALUES `)
-	args := make([]any, 0, len(ids)*8)
-	for i, id := range ids {
-		if i > 0 {
-			sb.WriteByte(',')
+	const receiptChunk = 100 // 8 columns x 100 = 800 vars per statement
+	for off := 0; off < len(ids); off += receiptChunk {
+		end := off + receiptChunk
+		if end > len(ids) {
+			end = len(ids)
 		}
-		att := 1
-		if j, ok := jobs[id]; ok {
-			att = j.Attempts
+		part := ids[off:end]
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO receipts (id, job_id, kind, attempt, error, reason, at, state) VALUES `)
+		args := make([]any, 0, len(part)*8)
+		for i, id := range part {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			att := 1
+			if j, ok := jobs[id]; ok {
+				att = j.Attempts
+			}
+			sb.WriteString("(?, ?, ?, ?, ?, '', ?, ?)")
+			args = append(args, newID(), id, kind, att, errText, at.Unix(), state)
 		}
-		sb.WriteString("(?, ?, ?, ?, ?, '', ?, ?)")
-		args = append(args, newID(), id, kind, att, errText, at.Unix(), state)
+		if _, err := s.db.ExecContext(ctx, sb.String(), args...); err != nil {
+			return err
+		}
 	}
-	_, err := s.db.ExecContext(ctx, sb.String(), args...)
-	return err
+	return nil
 }
 
 // addReceiptBatch writes one receipt per job in a single multi-VALUES

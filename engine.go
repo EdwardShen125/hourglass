@@ -267,9 +267,20 @@ func (e *engine) step(ctx context.Context) error {
 	for i, c := range cands {
 		ids[i] = c.ID
 	}
-	won, err := e.store.Acquire(ctx, scanUnitAll, e.epoch, ids)
-	if err != nil {
-		return fmt.Errorf("admission acquire: %w", err)
+	// acquire in bounded chunks: SQL drivers cap placeholders (SQLite
+	// ~32K vars; MySQL packet limits) — admission batches stay portable
+	won := make([]Job, 0, len(ids))
+	const acquireChunk = 500
+	for off := 0; off < len(ids); off += acquireChunk {
+		end := off + acquireChunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		part, err := e.store.Acquire(ctx, scanUnitAll, e.epoch, ids[off:end])
+		if err != nil {
+			return fmt.Errorf("admission acquire: %w", err)
+		}
+		won = append(won, part...)
 	}
 
 	var surplus []string
