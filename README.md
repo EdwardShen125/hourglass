@@ -124,12 +124,102 @@ futures — plus delayed-queue delivery backends (Pulsar, RocketMQ 5.x
 
 ## Comparison
 
+The short table, then the details. The axis that matters most is the
+last one: what does adding a process buy you?
+
 |            | durable state    | fire precision      | scaling model          |
 | ---------- | ---------------- | ------------------- | ---------------------- |
 | asynq      | Redis            | poll interval       | Redis ops ceiling      |
 | river      | PostgreSQL       | poll interval       | row locks              |
 | xxl-job    | any SQL          | dispatch loop       | lock contention        |
+| Temporal   | sharded SQL/NoSQL| per-shard timers    | shards fixed at boot   |
 | hourglass  | SQLite → SQL     | time wheel          | single node → sharded  |
+
+### vs asynq
+
+- **Truth lives in Redis** (sorted sets; AOF/RDB are backups): no
+  transactional audit trail — "did this side effect happen?" is not a
+  query you can run next to your domain tables. hourglass keeps every
+  job, attempt, and receipt as SQL rows.
+- **Delayed tasks wait on a poller**: asynq's forwarder moves due tasks
+  from the scheduled set every 5s (default), so worst-case fire error
+  tracks the interval and every server competes on the same zset.
+  hourglass admits windows into a wheel: p99 error 0ms at a 1s tick
+  (measured above), and the database goes quiet between windows.
+- **Scale-out is execution-only.** More asynq servers = more task
+  concurrency; scheduling throughput stays a constant of the single
+  scheduled-set scan. In hourglass, nodes own disjoint shards — more
+  nodes = more scheduling.
+- **Redis Cluster sharding exists per-queue but resharding breaks
+  multi-key operations** (their wiki says so); hourglass migration
+  moves scan ownership only — data never moves, nothing to redirect.
+- asynq wins on: a mature Web UI, task aggregation, uniqueness TTLs,
+  and raw enqueue latency (Redis writes). If you already run Redis and
+  need a queue today, asynq is a fine choice — it just isn't a
+  scheduler with an audit trail.
+
+### vs river
+
+- **`FOR UPDATE SKIP LOCKED` over one PostgreSQL table**: claiming is
+  row-lock contention under load, and discovery is polling with
+  LISTEN/NOTIFY as a doorbell (notifications may drop; the poll
+  backstops — their own docs describe the hybrid). The wheel removes
+  both the contention and the poll from the hot path.
+- **Single-database, single-dialect.** river is PostgreSQL-only, and
+  deep backlogs degenerate into increasingly expensive scans. hourglass
+  speaks SQLite (embedded) and MySQL/TiDB (sharded scans), and the
+  quiescence watermark means a 100K-row idle backlog costs ~2 reads per
+  quiet period, not a scan every interval.
+- **Same execution-only scale-out**: more river workers claim more
+  rows; the table remains one serialized surface.
+- river wins on: transactional enqueue inside your own Postgres
+  transactions (a genuinely nice property), years of production polish,
+  a UI, and no second system to run. If your workload fits one Postgres
+  and you want queue+DB atomicity, river is the pragmatic pick.
+
+### vs xxl-job (and its many descendants)
+
+- **A central dispatcher serializing on one task table**: every
+  schedule tick competes on the same rows; the DB is the bottleneck by
+  construction. hourglass's admission is per-shard CAS batches — no
+  central dispatcher exists.
+- **No durable audit of executions beyond logs**; misfires are
+  operator-visible, not queryable state. hourglass receipts make every
+  fire a row with an idempotency key.
+- xxl-job wins on: a battle-tested admin console, manual
+  run/kill/re-run UX, and Chinese-ecosystem integration. As an
+  embeddable engine it was never a candidate — which is exactly the gap
+  the ancestor system replaced it in production.
+
+### vs Temporal
+
+- **Same core ownership model** — hash → shard, one owner per shard, a
+  monotonic fencing generation (their RangeID is our epoch). What
+  Temporal proves is the model; what hourglass changes is the cost of
+  admission: Temporal is four services plus Cassandra/MySQL and a
+  fixed-at-creation shard count; hourglass is a Go library plus the SQL
+  and etcd you may already run, with 256 logical shards remapped
+  without moving data.
+- **hourglass is a time layer, not a workflow engine.** No event
+  history, no replay, no durable closures — deliberately (Non-goals).
+  Compose them: use hourglass for the timers that wake a Temporal
+  workflow when you need both.
+- Temporal wins on: workflows as code, replayable history, multi-SDK
+  ecosystem, and operational tooling at a scale few systems reach. If
+  you need durable execution, use Temporal; if you need durable *time*,
+  that is a smaller, sharper tool.
+
+### The honest summary
+
+- Need a task queue attached to Redis/Postgres with a UI, today:
+  **asynq / river** — both are good at what they are.
+- Need durable workflows with replay: **Temporal**.
+- Need a scheduler that is a library, auditable in SQL, second-precise
+  without polling, and whose scheduling throughput grows with nodes:
+  that is the gap hourglass occupies — measured, gated, and reproducible
+  in this repo.
+
+(Fuller notes with sources: [docs/lessons.md](docs/lessons.md) #11–12.)
 
 ## License
 
