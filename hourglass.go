@@ -146,6 +146,8 @@ type submitConfig struct {
 	jitter      time.Duration
 	maxAttempts int
 	backoff     time.Duration
+	shard       int
+	shardSet    bool
 }
 
 // At schedules the job at an exact time.
@@ -168,6 +170,12 @@ func Jitter(w time.Duration) SubmitOption {
 // Retries(2) = 3 total attempts. Default 0 (single attempt).
 func Retries(n int) SubmitOption {
 	return func(c *submitConfig) { c.maxAttempts = 1 + n }
+}
+
+// InShard forces the shard placement (tests, ops tooling; default is
+// hash(id)).
+func InShard(n int) SubmitOption {
+	return func(c *submitConfig) { c.shard, c.shardSet = n, true }
 }
 
 // RetryBackoff sets the delay before a failed attempt refires.

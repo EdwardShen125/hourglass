@@ -76,6 +76,55 @@ func (c *Cluster) engineFor(sh ScanUnit) *engine {
 	return c.engines[sh]
 }
 
+// addShardEpoch starts an engine for one shard under the given epoch.
+func (c *Cluster) addShardEpoch(sh ScanUnit, epoch uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.engines[sh]; ok {
+		return
+	}
+	c.engines[sh] = newEngineForShard(c.store, c.clk, c.cfg, sh, epoch)
+}
+
+// reclaimShard requeues stale in-flight rows under the new epoch — the
+// first act of a new owner after claim (graceful or failover).
+func (c *Cluster) reclaimShard(ctx context.Context, sh ScanUnit, epoch uint64) {
+	if ext, ok := c.store.(StoreExt); ok {
+		_, _ = ext.Reclaim(ctx, sh, epoch, 2*time.Minute)
+	}
+}
+
+// submit persists a job with hash shard placement (any node may submit).
+func (c *Cluster) submit(ctx context.Context, topic string, payload []byte, opts ...SubmitOption) (string, error) {
+	var cfg submitConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	if topic == "" {
+		return "", ErrEmptyTopic
+	}
+	if !cfg.hasDue {
+		return "", ErrMissingDue
+	}
+	j := &Job{Topic: topic, Payload: payload, Due: cfg.due, ScheduledAt: cfg.due, State: Waiting,
+		Attempts: 0, MaxAttempts: max(cfg.maxAttempts, 1), Backoff: cfg.backoff, CreatedAt: time.Now()}
+	if cfg.jitter > 0 {
+		j.Due = j.Due.Add(drawJitter(cfg.jitter, time.Now().UnixNano()))
+	}
+	if j.Backoff == 0 {
+		j.Backoff = 30 * time.Second
+	}
+	j.ID = newID()
+	j.Shard = ShardFor(j.ID)
+	if cfg.shardSet {
+		j.Shard = cfg.shard
+	}
+	if err := c.store.Insert(ctx, j); err != nil {
+		return "", err
+	}
+	return j.ID, nil
+}
+
 // Register binds a handler on every shard engine.
 func (c *Cluster) Register(topic string, h Handler) {
 	c.mu.Lock()
