@@ -12,11 +12,18 @@ import (
 )
 
 // BenchFirePrecision: |actual − scheduled| distribution for hourglass
-// (wheel) vs a poll-based baseline (checks the DB every P seconds, like
-// asynq/river at defaults), same randomized schedule.
+// (wheel) vs a poll-based baseline, same randomized schedule.
 //
 //	Fake clock; zero handler cost; the delta measures only the
 //	scheduling mechanism's latency.
+//
+// Fairness notes (review): hourglass is measured through its full
+// async pipeline (admission -> wheel -> dispatch -> flush) while the
+// poller baseline is an idealized synchronous loop (no dispatch layer,
+// no per-fire writes) — the bias is AGAINST hourglass. Intervals:
+// hourglass tick 1s vs poller 5s is a default-vs-default comparison;
+// both sides also count their mechanism's reads. The gates assert
+// hourglass tail dominance, not absolute equality.
 
 func TestBenchmarkFirePrecision(t *testing.T) {
 	if testing.Short() {
@@ -94,8 +101,12 @@ func TestBenchmarkFirePrecision(t *testing.T) {
 	errsPL := make([]float64, 0, nJobs)
 	fired := make(map[string]bool)
 	now := base
+	pollDeadline := base.Add(span + 2*pollEv) // every job is due within span
 	for len(errsPL) < nJobs {
 		now = now.Add(pollEv)
+		if now.After(pollDeadline) {
+			t.Fatalf("poller baseline failed to fire all %d jobs by %v", nJobs, pollDeadline)
+		}
 		js, err := sPL.Select(context.Background(), scanUnitAll, base, now, nJobs)
 		if err != nil {
 			t.Fatal(err)
@@ -123,6 +134,22 @@ func TestBenchmarkFirePrecision(t *testing.T) {
 		pct(errsHG, .50), pct(errsHG, .99), pct(errsHG, .999), pct(errsHG, 1.0))
 	t.Logf("  poller(5s interval):      p50=%v p99=%v p999=%v max=%v",
 		pct(errsPL, .50), pct(errsPL, .99), pct(errsPL, .999), pct(errsPL, 1.0))
+
+	// GATES (review: benchmarks were t.Logf-only demos). The wheel is
+	// second-granular with a 1s tick: p99 must sit at ~1 tick and max at
+	// ~2 ticks (tick truncation + one tick of dispatch). A regression to
+	// poller-grade precision (seconds of drift) fails here.
+	if p99 := pct(errsHG, .99); p99 > 1500 {
+		t.Errorf("hourglass fire precision regressed: p99=%vms, gate 1500ms", p99)
+	}
+	if mx := pct(errsHG, 1.0); mx > 3000 {
+		t.Errorf("hourglass fire precision regressed: max=%vms, gate 3000ms", mx)
+	}
+	// and hourglass must dominate the 5s poller at the tail
+	if pct(errsHG, .99) >= pct(errsPL, .99) {
+		t.Errorf("hourglass p99 (%vms) not better than 5s poller p99 (%vms)",
+			pct(errsHG, .99), pct(errsPL, .99))
+	}
 }
 
 // BenchQuiescence: database queries while idle with a large pending
@@ -175,4 +202,15 @@ func TestBenchmarkQuiescence(t *testing.T) {
 	t.Logf("quiescence over %v idle, %d pending:", idleFor, pending)
 	t.Logf("  hourglass: %d statements (%.1f/min)", hgQueries, float64(hgQueries)/(idleFor.Minutes()))
 	t.Logf("  poller:    %d statements (%.1f/min)", plQueries, float64(plQueries)/(idleFor.Minutes()))
+
+	// GATES: with the quiescence watermark active, admission does ~2
+	// reads per quiet period (empty scan + MIN(due)) over 10 minutes —
+	// not one per tick. Without it, hourglass reads every second (600+).
+	if hgQueries > 10 {
+		t.Errorf("hourglass quiescence regressed: %d reads over %v idle, gate 10 (watermark inactive?)", hgQueries, idleFor)
+	}
+	// the poller cannot help itself: one scan per interval forever
+	if plQueries < int64(idleFor/pollEv)-1 {
+		t.Errorf("poller baseline suspiciously quiet: %d reads, expected ~%d", plQueries, int64(idleFor/pollEv))
+	}
 }

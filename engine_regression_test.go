@@ -18,6 +18,8 @@ func TestSubmitWakesQuiescentAdmission(t *testing.T) {
 	e := newEngine(s, clk, engineConfig{lookahead: 1 * time.Minute, admitLimit: 100})
 	t.Cleanup(func() { e.Close() })
 	ctx := context.Background()
+	e.Register("near", func(context.Context, Job) error { return nil })
+	e.Register("far", func(context.Context, Job) error { return nil })
 
 	// far-future job sets the watermark
 	e.Submit(ctx, "far", nil, At(clk.Now().Add(6*time.Hour)))

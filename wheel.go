@@ -63,6 +63,13 @@ type wheelLevel struct {
 
 var wheelSize int64 = 60
 
+func maxTime(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
+}
+
 func newWheel(clk clock, epoch uint64) *wheel {
 	w := &wheel{
 		clk:      clk,
@@ -131,6 +138,15 @@ func (w *wheel) insert(e *wheelEntry) {
 	top.buckets[idx] = append(top.buckets[idx], e)
 }
 
+// SetEpoch revokes old ownership: entries admitted under any earlier
+// epoch become zombies and are dropped at their fire tick (fencing is
+// checked per batch on the fire path).
+func (w *wheel) SetEpoch(epoch uint64) {
+	w.mu.Lock()
+	w.epoch = epoch
+	w.mu.Unlock()
+}
+
 // Cancel marks an admitted-but-unfired entry canceled. Returns false
 // when the id is unknown or already fired — cancel after fire is not a
 // thing.
@@ -153,16 +169,18 @@ func (w *wheel) Tick(now time.Time) []wheelEntry {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	now = now.Truncate(time.Second)
-	if now.Before(w.now) {
-		return nil
-	}
 	var due []wheelEntry
 	// ready fires first: misfires and same-second admissions must not
-	// wait for the clock to move.
+	// wait for the clock to move — even when the tick target is behind
+	// the wheel's time (a job admitted past-due relative to the wheel
+	// clock rides ready and must fire on the very next tick).
 	if len(w.ready) > 0 {
 		batch := w.ready
 		w.ready = nil
-		due = append(due, w.collectBatch(batch, now)...)
+		due = append(due, w.collectBatch(batch, maxTime(now, w.now))...)
+	}
+	if now.Before(w.now) {
+		return due
 	}
 	if !now.After(w.now) {
 		return due

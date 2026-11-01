@@ -145,7 +145,7 @@ func TestEngineFailedHandlerDeadLetters(t *testing.T) {
 
 func waitJobState(t *testing.T, e *engine, id string, want State) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		j, err := e.Get(context.Background(), id)
 		if err == nil && j.State == want {
@@ -153,4 +153,12 @@ func waitJobState(t *testing.T, e *engine, id string, want State) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	// FAIL on timeout: a wait that returns silently is a vacuous
+	// assertion (review finding).
+	j, err := e.Get(context.Background(), id)
+	state := "nil"
+	if err == nil && j != nil {
+		state = string(j.State)
+	}
+	t.Fatalf("job %s never reached %s within 5s (stuck in %s)", id, want, state)
 }
