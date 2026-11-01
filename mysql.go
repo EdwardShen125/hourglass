@@ -211,15 +211,19 @@ func (s *mysqlStore) Acquire(ctx context.Context, unit ScanUnit, epoch uint64, i
 	return won, nil
 }
 
-// Reclaim takes acquired/fired rows whose lease (acquired_at) aged past
-// the TTL and requeues them to waiting under a NEW epoch — the new
-// owner's first act after a lease expiry takeover. One statement, no
-// coordinator: the database is the arbiter (river lesson #11).
+// Reclaim takes over in-flight rows for a shard: any acquired/fired row
+// whose EPOCH predates the new owner's epoch is stale by definition
+// (ownership was revoked; the old owner's writes are fenced), and rows
+// whose lease (acquired_at) aged past the TTL are stale by age. Both
+// requeue to waiting under the NEW epoch — the new owner's first act
+// after any takeover. One statement, no coordinator: the database is
+// the arbiter (river lesson #11 + epoch fencing).
 func (s *mysqlStore) Reclaim(ctx context.Context, unit ScanUnit, epoch uint64, ttl time.Duration) (int, error) {
 	cutoff := time.Now().Add(-ttl).Unix()
 	q := `UPDATE jobs SET state='waiting', epoch=?, attempts=0, terminal_at=0
-	      WHERE state IN ('acquired','fired') AND acquired_at > 0 AND acquired_at < ?`
-	args := []any{epoch, cutoff}
+	      WHERE state IN ('acquired','fired')
+	        AND (epoch < ? OR (acquired_at > 0 AND acquired_at < ?))`
+	args := []any{epoch, epoch, cutoff}
 	if unit != scanUnitAll {
 		q += ` AND shard = ?`
 		args = append(args, unit2shard(unit))

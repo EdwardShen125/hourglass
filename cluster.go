@@ -16,24 +16,26 @@ import (
 // (etcd leases + epoch fencing, DESIGN.md "Shard registry"); Cluster is
 // the per-process executor of whatever ownership it is handed.
 type Cluster struct {
-	store   Store
-	clk     clock
-	cfg     engineConfig
-	epoch   uint64
-	mu      sync.Mutex
-	engines map[ScanUnit]*engine
-	closed  bool
+	store    Store
+	clk      clock
+	cfg      engineConfig
+	epoch    uint64
+	mu       sync.Mutex
+	engines  map[ScanUnit]*engine
+	closed   bool
+	handlers map[string]Handler // engines added later inherit these
 }
 
 // NewCluster creates a cluster executor for the given shards under one
 // epoch. All engines share the store and the handler registry.
 func newCluster(s Store, clk clock, cfg engineConfig, shards []ScanUnit) *Cluster {
 	c := &Cluster{
-		store:   s,
-		clk:     clk,
-		cfg:     cfg,
-		epoch:   1,
-		engines: make(map[ScanUnit]*engine, len(shards)),
+		store:    s,
+		clk:      clk,
+		cfg:      cfg,
+		epoch:    1,
+		engines:  make(map[ScanUnit]*engine, len(shards)),
+		handlers: make(map[string]Handler),
 	}
 	for _, sh := range shards {
 		c.addShard(sh)
@@ -48,7 +50,11 @@ func (c *Cluster) addShard(sh ScanUnit) {
 	if _, ok := c.engines[sh]; ok {
 		return
 	}
-	c.engines[sh] = newEngineForShard(c.store, c.clk, c.cfg, sh, c.epoch)
+	e := newEngineForShard(c.store, c.clk, c.cfg, sh, c.epoch)
+	for topic, h := range c.handlers {
+		e.Register(topic, h)
+	}
+	c.engines[sh] = e
 }
 
 // DropShard stops one shard's engine (graceful handoff step 1: the
@@ -83,7 +89,11 @@ func (c *Cluster) addShardEpoch(sh ScanUnit, epoch uint64) {
 	if _, ok := c.engines[sh]; ok {
 		return
 	}
-	c.engines[sh] = newEngineForShard(c.store, c.clk, c.cfg, sh, epoch)
+	e := newEngineForShard(c.store, c.clk, c.cfg, sh, epoch)
+	for topic, h := range c.handlers {
+		e.Register(topic, h)
+	}
+	c.engines[sh] = e
 }
 
 // reclaimShard requeues stale in-flight rows under the new epoch — the
@@ -125,10 +135,13 @@ func (c *Cluster) submit(ctx context.Context, topic string, payload []byte, opts
 	return j.ID, nil
 }
 
-// Register binds a handler on every shard engine.
+// Register binds a handler on every shard engine, including engines
+// added later (AddShard after Register inherits the registry — the
+// failover bench caught reclaimed jobs firing into empty handlers).
 func (c *Cluster) Register(topic string, h Handler) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.handlers[topic] = h
 	for _, e := range c.engines {
 		e.Register(topic, h)
 	}
@@ -177,6 +190,38 @@ func (c *Cluster) Run(ctx context.Context) {
 			_ = c.stepAll(ctx)
 		}
 	}
+}
+
+// KillForTest stops every engine WITHOUT draining: unfired wheel
+// entries are abandoned in the acquired state for the next owner to
+// reclaim (hard-kill semantics; the process is gone, the rows remain).
+func (c *Cluster) KillForTest() {
+	c.mu.Lock()
+	engines := make([]*engine, 0, len(c.engines))
+	for sh, e := range c.engines {
+		engines = append(engines, e)
+		delete(c.engines, sh)
+	}
+	c.mu.Unlock()
+	for _, e := range engines {
+		e.closeForKill()
+	}
+}
+
+// closeForKill stops the engine without the graceful drain.
+func (e *engine) closeForKill() {
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return
+	}
+	e.closed = true
+	e.mu.Unlock()
+	close(e.done)
+	close(e.dispatch)
+	e.wg.Wait()
+	e.closeExecutor()
+	_ = e.wheel.Close()
 }
 
 // Close stops every shard engine (drains dispatch, waits for handlers).

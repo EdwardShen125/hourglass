@@ -117,6 +117,24 @@ func (n *Node) Cancel(ctx context.Context, id, reason string) error {
 // Run drives all owned shard engines until ctx is done.
 func (n *Node) Run(ctx context.Context) { n.clus.Run(ctx) }
 
+// KillForTest simulates a hard kill: engines stop mid-flight (rows stay
+// acquired) and the etcd session dies WITHOUT handover — leases expire
+// and peers take over via reclaim. The node must not be used afterwards
+// except Close.
+func (n *Node) KillForTest() {
+	n.clus.KillForTest()
+	n.reg.Crash()
+}
+
+// EnginesForTest exposes owned shard engines (bench tooling).
+func (n *Node) EnginesForTest() map[string]struct{} {
+	out := map[string]struct{}{}
+	for k := range n.engines() {
+		out[string(k)] = struct{}{}
+	}
+	return out
+}
+
 // Close hands nothing over (use Handover per shard for graceful exit)
 // and releases everything.
 func (n *Node) Close() error {
