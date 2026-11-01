@@ -210,8 +210,8 @@ quadrantChart
     "asynq": [0.2, 0.28]
     "river": [0.3, 0.6]
     "xxl-job": [0.15, 0.5]
-    "Temporal": [0.78, 0.88]
-    "hourglass": [0.82, 0.85]
+    "Temporal": [0.8, 0.9]
+    "hourglass": [0.8, 0.82]
 ```
 
 What happens on the hot path when a job becomes due:
@@ -241,7 +241,7 @@ flowchart TB
 |              | asynq          | river            | xxl-job        | Temporal         | hourglass          |
 | ------------ | -------------- | ---------------- | -------------- | ---------------- | ------------------ |
 | truth        | Redis zset     | PG rows          | SQL + logs     | sharded history  | SQL rows + receipts|
-| precision    | 5s forwarder   | ~1s (leader scheduler + fetch) | dispatch loop | per-shard timer | time wheel (0ms p50 @ 1s tick) |
+| precision    | 5s forwarder   | ~1s (leader scheduler + fetch) | dispatch loop | timer gate at the timestamp (wake = workflow callback through 3 hops) | time wheel (0ms p50 @ 1s tick; handler in process) |
 | scheduling plane | every server (redundant forwarders) | elected leader | central dispatcher (SPOF) | shard owners | shard owners |
 | scale-out    | execution only | execution only   | dispatcher-bound | shards (fixed at boot) | shards (movable, no data moves) |
 | cron durability | scheduler process memory | leader memory — may skip on election (durable = Pro) | DB rows | event history | job row (completed → waiting) |
@@ -259,9 +259,15 @@ One line each, honestly:
   durable periodic is a Pro feature).
 - **xxl-job** — battle-tested console; a central dispatcher on one
   table is the bottleneck the ancestor system replaced in production.
-- **Temporal** — durable workflows with replay; four services and a
-  shard count fixed at creation. Its RangeID fencing is our epoch:
-  same model, smaller admission price.
+- **Temporal** — the same shard-owner + fencing-generation model (its
+  RangeID is our epoch; verified in source), carrying a workflow engine
+  on top: timers wake workflow callbacks through the
+  history→matching→worker pipeline, shards own workflow runs and are
+  fixed at cluster creation, and fencing lives in a DB row lock (one
+  documented thundering-herd failure mode) rather than a coordinator.
+  Durable execution is the product; a durable timer shouldn't need it.
+  Deep dive with file-level sources:
+  [docs/research-temporal.md](docs/research-temporal.md).
 - **hourglass** — durable *time* as a library: SQL truth, wheel
   precision, scheduling that grows with nodes. Not a workflow engine,
   by design — compose it with Temporal when you need replay.
