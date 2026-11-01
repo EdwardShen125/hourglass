@@ -62,6 +62,51 @@ and peaked above 200K execution commands per second — that story, and
 the failures that shaped it, is documented here:
 [Building a Production Go Scheduler for 200K+ Delayed Jobs per Second](https://edwardshen125.github.io/posts/engineering-case-study/building-a-production-go-scheduler-for-200k-delayed-jobs-per-second/).
 
+```mermaid
+flowchart LR
+    subgraph submit["any process"]
+        S("Submit / Cancel / Get")
+    end
+    subgraph storebox["the database owns the long horizon"]
+        DB[("jobs + receipts
+        every state is a row")]
+    end
+    subgraph enginebox["each engine owns one shard"]
+        AL["admission loop
+        window scan + CAS batch"]
+        TW["hierarchical time wheel
+        second-level fire"]
+        WP["worker pool / gRPC executor"]
+    end
+    S --> DB
+    DB -- "window enters lookahead" --> AL
+    AL -- "epoch-stamped acquire" --> TW
+    TW -- "fire at the second" --> WP
+    WP -- "complete / dead / retry receipts" --> DB
+    DB -. "quiescence watermark: quiet store = zero scans" .- AL
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> waiting: submit
+    waiting --> acquired: CAS admission, epoch stamped
+    acquired --> fired: wheel fires, receipt written
+    fired --> completed: handler ok
+    fired --> dead: retries exhausted
+    fired --> waiting: retry backoff / executor reschedule
+    waiting --> canceled: strong cancel, before fire
+    acquired --> canceled: cancel wins until the fire moment
+    acquired --> waiting: wheel overflow / crash recovery
+    completed --> waiting: cron next occurrence
+    dead --> waiting: dlq replay
+    canceled --> [*]: receipt until retention
+    completed --> [*]: receipt until retention
+    dead --> [*]: receipt until retention
+```
+
+The production ancestors and design trade-offs behind each mechanism:
+[docs/lessons.md](docs/lessons.md).
+
 ## Measured (v1.0 benchmarks, fake clock, in-repo and reproducible)
 
 | benchmark | hourglass | poll-based baseline |
@@ -116,6 +161,35 @@ v1.0 scope:
       misfire rescan
 - [ ] Executor SDK (gRPC): registration, heartbeat, idempotency
 
+```mermaid
+flowchart TB
+    subgraph etcd["etcd — linearizable ownership truth"]
+        E1["/shards/0/owner → node-a  lease TTL"]
+        E2["/shards/1/owner → node-b  lease TTL"]
+        E3["/shards/255/epoch = 41  durable generation"]
+    end
+    subgraph mysql["MySQL / TiDB — shared durable truth"]
+        M[("jobs (shard, state, due, epoch)
+        receipts")]
+    end
+    NA["node-a
+    engines: shard 0…31"]
+    NB["node-b
+    engines: shard 32…255"]
+    NC["node-c
+    joins → claims → balances"]
+    NA <-.->|claim / lease keepalive / epoch bump| etcd
+    NB <-.->|watch: explicit ownership loss| etcd
+    NC <-.->|claim free shards| etcd
+    NA --> M
+    NB --> M
+    NC --> M
+```
+
+Adding node-c claims free shards: **scheduling throughput grows with
+nodes** — no leader, no failover service, no data movement (migration
+moves scan ownership only).
+
 Post-1.0, on demand: an MCP agent face (`hourglass mcp`, declarative
 webhook targets, self-chaining acks, event-anchored delays, debounce
 windows) — durable time for agents that cannot hold their own
@@ -124,100 +198,66 @@ futures — plus delayed-queue delivery backends (Pulsar, RocketMQ 5.x
 
 ## Comparison
 
-The short table, then the details. The axis that matters most is the
-last one: what does adding a process buy you?
+```mermaid
+quadrantChart
+    title where each system sits
+    x-axis "scheduling throughput is a constant" --> "scheduling scales with nodes"
+    y-axis "memory / cache is the truth" --> "SQL rows are the truth"
+    quadrant-1 "durable + scalable"
+    quadrant-2 "durable, single-plane"
+    quadrant-3 "cache-truth, single-plane"
+    quadrant-4 "cache-truth, scalable"
+    "asynq": [0.22, 0.25]
+    "river": [0.35, 0.62]
+    "xxl-job": [0.3, 0.55]
+    "Temporal": [0.78, 0.88]
+    "hourglass": [0.82, 0.85]
+```
 
-|            | durable state    | fire precision      | scaling model          |
-| ---------- | ---------------- | ------------------- | ---------------------- |
-| asynq      | Redis            | poll interval       | Redis ops ceiling      |
-| river      | PostgreSQL       | poll interval       | row locks              |
-| xxl-job    | any SQL          | dispatch loop       | lock contention        |
-| Temporal   | sharded SQL/NoSQL| per-shard timers    | shards fixed at boot   |
-| hourglass  | SQLite → SQL     | time wheel          | single node → sharded  |
+What happens on the hot path when a job becomes due:
 
-### vs asynq
+```mermaid
+flowchart TB
+    subgraph A["asynq"]
+        A1["scheduled zset"] -->|forwarder polls every 5s| A2["live queue"] --> A3["worker"]
+    end
+    subgraph R["river"]
+        R1["jobs table"] -->|poll + SKIP LOCKED
+        NOTIFY as doorbell| R2["worker claim"]
+    end
+    subgraph X["xxl-job"]
+        X1["central dispatcher"] -->|serializes on one table| X2["trigger"] --> X3["executor"]
+    end
+    subgraph H["hourglass"]
+        H1["window enters lookahead"] -->|"CAS batch (epoch)"| H2["wheel fires
+        at the second"] --> H3["handler / gRPC executor"]
+        H1 -. "quiet store: watermark, zero scans" .- H1
+    end
+```
 
-- **Truth lives in Redis** (sorted sets; AOF/RDB are backups): no
-  transactional audit trail — "did this side effect happen?" is not a
-  query you can run next to your domain tables. hourglass keeps every
-  job, attempt, and receipt as SQL rows.
-- **Delayed tasks wait on a poller**: asynq's forwarder moves due tasks
-  from the scheduled set every 5s (default), so worst-case fire error
-  tracks the interval and every server competes on the same zset.
-  hourglass admits windows into a wheel: p99 error 0ms at a 1s tick
-  (measured above), and the database goes quiet between windows.
-- **Scale-out is execution-only.** More asynq servers = more task
-  concurrency; scheduling throughput stays a constant of the single
-  scheduled-set scan. In hourglass, nodes own disjoint shards — more
-  nodes = more scheduling.
-- **Redis Cluster sharding exists per-queue but resharding breaks
-  multi-key operations** (their wiki says so); hourglass migration
-  moves scan ownership only — data never moves, nothing to redirect.
-- asynq wins on: a mature Web UI, task aggregation, uniqueness TTLs,
-  and raw enqueue latency (Redis writes). If you already run Redis and
-  need a queue today, asynq is a fine choice — it just isn't a
-  scheduler with an audit trail.
+|              | asynq          | river            | xxl-job        | Temporal         | hourglass          |
+| ------------ | -------------- | ---------------- | -------------- | ---------------- | ------------------ |
+| truth        | Redis zset     | PG rows          | SQL + logs     | sharded history  | SQL rows + receipts|
+| precision    | poll interval  | poll interval    | dispatch loop  | per-shard timer  | time wheel         |
+| scale-out    | execution only | execution only   | dispatcher-bound | shards (fixed) | shards (movable)   |
+| audit        | —              | rows             | logs           | event history    | receipts (SQL)     |
+| cancel       | admission-time | claim-time       | manual         | workflow-level   | until fire moment  |
+| dependency   | Redis          | PostgreSQL       | DB + central   | 4 services + DB  | the SQL you run    |
 
-### vs river
+One line each, honestly:
 
-- **`FOR UPDATE SKIP LOCKED` over one PostgreSQL table**: claiming is
-  row-lock contention under load, and discovery is polling with
-  LISTEN/NOTIFY as a doorbell (notifications may drop; the poll
-  backstops — their own docs describe the hybrid). The wheel removes
-  both the contention and the poll from the hot path.
-- **Single-database, single-dialect.** river is PostgreSQL-only, and
-  deep backlogs degenerate into increasingly expensive scans. hourglass
-  speaks SQLite (embedded) and MySQL/TiDB (sharded scans), and the
-  quiescence watermark means a 100K-row idle backlog costs ~2 reads per
-  quiet period, not a scan every interval.
-- **Same execution-only scale-out**: more river workers claim more
-  rows; the table remains one serialized surface.
-- river wins on: transactional enqueue inside your own Postgres
-  transactions (a genuinely nice property), years of production polish,
-  a UI, and no second system to run. If your workload fits one Postgres
-  and you want queue+DB atomicity, river is the pragmatic pick.
-
-### vs xxl-job (and its many descendants)
-
-- **A central dispatcher serializing on one task table**: every
-  schedule tick competes on the same rows; the DB is the bottleneck by
-  construction. hourglass's admission is per-shard CAS batches — no
-  central dispatcher exists.
-- **No durable audit of executions beyond logs**; misfires are
-  operator-visible, not queryable state. hourglass receipts make every
-  fire a row with an idempotency key.
-- xxl-job wins on: a battle-tested admin console, manual
-  run/kill/re-run UX, and Chinese-ecosystem integration. As an
-  embeddable engine it was never a candidate — which is exactly the gap
-  the ancestor system replaced it in production.
-
-### vs Temporal
-
-- **Same core ownership model** — hash → shard, one owner per shard, a
-  monotonic fencing generation (their RangeID is our epoch). What
-  Temporal proves is the model; what hourglass changes is the cost of
-  admission: Temporal is four services plus Cassandra/MySQL and a
-  fixed-at-creation shard count; hourglass is a Go library plus the SQL
-  and etcd you may already run, with 256 logical shards remapped
-  without moving data.
-- **hourglass is a time layer, not a workflow engine.** No event
-  history, no replay, no durable closures — deliberately (Non-goals).
-  Compose them: use hourglass for the timers that wake a Temporal
-  workflow when you need both.
-- Temporal wins on: workflows as code, replayable history, multi-SDK
-  ecosystem, and operational tooling at a scale few systems reach. If
-  you need durable execution, use Temporal; if you need durable *time*,
-  that is a smaller, sharper tool.
-
-### The honest summary
-
-- Need a task queue attached to Redis/Postgres with a UI, today:
-  **asynq / river** — both are good at what they are.
-- Need durable workflows with replay: **Temporal**.
-- Need a scheduler that is a library, auditable in SQL, second-precise
-  without polling, and whose scheduling throughput grows with nodes:
-  that is the gap hourglass occupies — measured, gated, and reproducible
-  in this repo.
+- **asynq** — great Redis-backed queue with a UI; delayed precision is
+  a poller's interval and the audit trail is Redis.
+- **river** — great Postgres-native queue; transactional enqueue is a
+  genuinely nice property; scheduling stays one serialized table.
+- **xxl-job** — battle-tested console; a central dispatcher on one
+  table is the bottleneck the ancestor system replaced in production.
+- **Temporal** — durable workflows with replay; four services and a
+  shard count fixed at creation. Its RangeID fencing is our epoch:
+  same model, smaller admission price.
+- **hourglass** — durable *time* as a library: SQL truth, wheel
+  precision, scheduling that grows with nodes. Not a workflow engine,
+  by design — compose it with Temporal when you need replay.
 
 (Fuller notes with sources: [docs/lessons.md](docs/lessons.md) #11–12.)
 
