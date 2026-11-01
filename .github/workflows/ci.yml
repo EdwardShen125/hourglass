@@ -1,0 +1,113 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint (vet + fmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: go vet
+        run: go vet ./...
+      - name: gofmt check
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "files not gofmt-ed:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: build
+        run: go build ./...
+
+  test:
+    name: unit tests (race)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: go test -race
+        # MySQL/etcd suites auto-skip without TEST_MYSQL_DSN/TEST_ETCD_ADDR
+        run: go test -race -timeout 20m ./...
+
+  integration:
+    name: integration (mysql + etcd)
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: hgtest
+          MYSQL_DATABASE: hourglass
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -uroot -phgtest --silent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      etcd:
+        image: gcr.io/etcd-development/etcd:v3.5.17
+        ports:
+          - 2379:2379
+        options: >-
+          --entrypoint etcd
+          --health-cmd "etcdctl --endpoints=http://127.0.0.1:2379 endpoint health"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      TEST_MYSQL_DSN: root:hgtest@tcp(127.0.0.1:3306)/hourglass
+      TEST_ETCD_ADDR: http://127.0.0.1:2379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: wait for services
+        run: |
+          for i in $(seq 1 30); do
+            mysql_ready=0; etcd_ready=0
+            if command -v mysql >/dev/null 2>&1; then
+              mysql -h 127.0.0.1 -P 3306 -uroot -phgtest -e "SELECT 1" >/dev/null 2>&1 && mysql_ready=1
+            fi
+            curl -sf http://127.0.0.1:2379/health >/dev/null 2>&1 && etcd_ready=1
+            # fall back to raw TCP checks when clients are absent
+            (echo > /dev/tcp/127.0.0.1/3306) >/dev/null 2>&1 && mysql_ready=1
+            (echo > /dev/tcp/127.0.0.1/2379) >/dev/null 2>&1 && etcd_ready=1
+            [ "$mysql_ready" = 1 ] && [ "$etcd_ready" = 1 ] && echo "services ready" && exit 0
+            sleep 2
+          done
+          echo "services did not become ready"; exit 1
+      - name: integration tests
+        run: go test -race -timeout 15m -run 'TestMySQL|TestRegistry|TestTwoNode|TestJoin|TestGraceful' -v ./...
+
+  bench-gates:
+    name: benchmark gates (precision, quiescence, hot minute)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gated benchmarks
+        # assertions live inside the tests: wheel precision p99<1.5s,
+        # quiescence <=10 reads/10m, hot-minute write amplification <=n
+        run: go test -timeout 15m -run 'TestBenchmark' -v ./...
