@@ -561,6 +561,9 @@ func (s *sqliteStore) purgeTerminal(ctx context.Context, now time.Time, ttl time
 	return int(n), nil
 }
 
+// rawDB exposes the underlying *sql.DB (engine stats probe).
+func (s *sqliteStore) rawDB() *sql.DB { return s.db.DB }
+
 func (s *sqliteStore) stmtCount() int64 { return s.db.stmts.Load() }
 
 // minPendingDueIn returns the earliest waiting due inside one scan

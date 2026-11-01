@@ -209,7 +209,7 @@ func (e *engine) maybeReschedule(ctx context.Context, id string) {
 		return // no further occurrence within the horizon: recurrence ends
 	}
 	_ = e.transition(ctx, id, Completed, Waiting) // reschedule owns this edge
-	_ = e.store.(*sqliteStore).setDue(ctx, id, next)
+	_ = e.store.setDue(ctx, id, next)
 }
 
 // Cancel revokes a job: waiting/acquired rows flip to canceled (a
@@ -226,10 +226,10 @@ func (e *engine) Cancel(ctx context.Context, id, reason string) error {
 		// wheel mark first (no-op if not admitted): a late mark is
 		// harmless, a missed mark is a delivery
 		e.wheel.Cancel(id)
-		if err := e.store.(*sqliteStore).cancel(ctx, id, reason); err != nil {
+		if err := e.store.cancel(ctx, id, reason); err != nil {
 			return err
 		}
-		return e.store.(*sqliteStore).addReceiptSingle(ctx, id, "canceled", "", reason, "canceled", e.clk.Now())
+		return e.store.addReceiptSingle(ctx, id, "canceled", "", reason, "canceled", e.clk.Now())
 	case Fired, Completed, Dead, Canceled:
 		return fmt.Errorf("hourglass: job %s already %s; cancel only wins before fire", id, j.State)
 	}
@@ -261,7 +261,7 @@ func (e *engine) step(ctx context.Context) error {
 		// crosses the lookahead while admission sleeps is still inside
 		// the scan floor when we wake — a job can never fall below the
 		// horizon and get lost (review finding #1).
-		minDue, ok, err := e.store.(*sqliteStore).minPendingDueIn(ctx, e.unit)
+		minDue, ok, err := e.store.minPendingDueIn(ctx, e.unit)
 		if err == nil && ok && minDue.After(now.Add(e.cfg.lookahead)) {
 			wake := minDue.Add(-e.cfg.lookahead)
 			if cap := now.Add(e.cfg.misfireHalo / 2); wake.After(cap) {
@@ -334,11 +334,11 @@ func (e *engine) pump(now time.Time) {
 	if err := e.transitionBatch(ctx, Acquired, Fired, ids, now); err != nil {
 		return
 	}
-	_ = e.store.(*sqliteStore).attemptFor(ctx, ids) // attempts+1, batched
+	_ = e.store.attemptFor(ctx, ids) // attempts+1, batched
 
 	// one re-read for the whole batch: handlers get their job row without
 	// a per-job Get
-	jobs, err := e.store.(*sqliteStore).getMany(ctx, ids)
+	jobs, err := e.store.getMany(ctx, ids)
 	if err != nil {
 		return
 	}
@@ -359,7 +359,7 @@ func (e *engine) pump(now time.Time) {
 	if len(firedIDs) > 0 {
 		// one receipt per fired job with per-job attempt numbers (one
 		// multi-VALUES insert); rows re-read after the attempt bump
-		_ = e.store.(*sqliteStore).addReceiptAttempt(ctx, firedIDs, jobs, "fired", now)
+		_ = e.store.addReceiptAttempt(ctx, firedIDs, jobs, "fired", now)
 	}
 	if len(deliver) == 0 {
 		return
@@ -388,13 +388,13 @@ func (e *engine) pump(now time.Time) {
 		// batch so the flush fires for the delivered remainder
 		res.shrink(len(spill))
 		_ = e.transitionBatch(ctx, Fired, Waiting, spill, now)
-		_ = e.store.(*sqliteStore).attemptForRollback(ctx, spill)
+		_ = e.store.attemptForRollback(ctx, spill)
 	}
 	res.setFlush(func(doneIds, deadIds []string, deadErrs map[string]string) {
 		_ = now2
 		if len(doneIds) > 0 {
 			_ = e.transitionBatch(ctx, Fired, Completed, doneIds, now2)
-			_ = e.store.(*sqliteStore).addReceiptAttempt(ctx, doneIds, jobs, "completed", now2)
+			_ = e.store.addReceiptAttempt(ctx, doneIds, jobs, "completed", now2)
 			for _, id := range doneIds {
 				e.maybeReschedule(ctx, id)
 			}
@@ -416,7 +416,7 @@ func (e *engine) pump(now time.Time) {
 			}
 			if len(retry) > 0 {
 				for _, id := range retry {
-					_ = e.store.(*sqliteStore).retryFor(ctx, id, now2, jobs[id].Backoff)
+					_ = e.store.retryFor(ctx, id, now2, jobs[id].Backoff)
 				}
 			}
 			// receipts: dead or retry kind, grouped by error text
@@ -434,10 +434,10 @@ func (e *engine) pump(now time.Time) {
 					}
 				}
 				if len(deadGroup) > 0 {
-					_ = e.store.(*sqliteStore).addReceiptAttemptErr(ctx, deadGroup, jobs, "dead", txt, now2)
+					_ = e.store.addReceiptAttemptErr(ctx, deadGroup, jobs, "dead", txt, now2)
 				}
 				if len(retryGroup) > 0 {
-					_ = e.store.(*sqliteStore).addReceiptAttemptErr(ctx, retryGroup, jobs, "retry", txt, now2)
+					_ = e.store.addReceiptAttemptErr(ctx, retryGroup, jobs, "retry", txt, now2)
 				}
 			}
 		}
@@ -556,20 +556,40 @@ func (e *engine) handlerFor(topic string) Handler {
 // transition advances a job's state atomically: UPDATE ... WHERE
 // state = from. Illegal edges and lost races fail cleanly.
 func (e *engine) transition(ctx context.Context, id string, from, to State) error {
-	return e.store.(*sqliteStore).transition(ctx, id, from, to)
+	return e.store.transition(ctx, id, from, to)
 }
 
 // transitionBatch is the batched form (one statement per tick).
 func (e *engine) transitionBatch(ctx context.Context, from, to State, ids []string, at time.Time) error {
-	return e.store.(*sqliteStore).transitionBatch(ctx, from, to, ids, at)
+	return e.store.transitionBatch(ctx, from, to, ids, at)
 }
 
+// stmtCounter is the test-only store probe for write counts.
+type stmtCounter interface{ stmtCount() int64 }
+
 // stmtCount exposes the store's statement counter (tests only).
-func (e *engine) stmtCount() int64 { return e.store.(*sqliteStore).stmtCount() }
+func (e *engine) stmtCount() int64 {
+	if c, ok := e.store.(stmtCounter); ok {
+		return c.stmtCount()
+	}
+	return 0
+}
+
+// statsQuerier is the CLI store probe for stats.
+type statsQuerier interface {
+	statsByState(ctx context.Context) *Stats
+}
 
 // storeStats summarizes jobs by state for `hourglass stats`.
 func (e *engine) storeStats(ctx context.Context) *Stats {
-	rows, err := e.store.(*sqliteStore).db.QueryContext(ctx,
+	var db *sql.DB
+	if p, ok := e.store.(interface{ rawDB() *sql.DB }); ok {
+		db = p.rawDB()
+	}
+	if db == nil {
+		return &Stats{}
+	}
+	rows, err := db.QueryContext(ctx,
 		`SELECT state, COUNT(*) FROM jobs GROUP BY state ORDER BY state`)
 	if err != nil {
 		return &Stats{}
@@ -586,10 +606,10 @@ func (e *engine) storeStats(ctx context.Context) *Stats {
 		st.JobsByState = append(st.JobsByState, sc)
 		st.TotalJobs += sc.Count
 	}
-	_ = e.store.(*sqliteStore).db.QueryRowContext(ctx,
+	_ = db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM receipts`).Scan(&st.TotalReceipts)
 	var oldest sql.NullInt64
-	_ = e.store.(*sqliteStore).db.QueryRowContext(ctx,
+	_ = db.QueryRowContext(ctx,
 		`SELECT MIN(terminal_at) FROM jobs WHERE state IN ('completed','dead','canceled') AND terminal_at > 0`).Scan(&oldest)
 	if oldest.Valid && oldest.Int64 > 0 {
 		st.OldestTerminal = time.Unix(oldest.Int64, 0).UTC()
@@ -597,15 +617,30 @@ func (e *engine) storeStats(ctx context.Context) *Stats {
 	return st
 }
 
+// deadLister is the CLI store probe.
+type deadLister interface {
+	listDead(ctx context.Context, topic string, limit int) ([]Job, error)
+	listDeadIDs(ctx context.Context) ([]string, error)
+}
+
 // listDead lists dead rows newest-first for `hourglass dlq ls`.
 func (e *engine) listDead(ctx context.Context, topic string, limit int) ([]Job, error) {
-	return e.store.(*sqliteStore).listDead(ctx, topic, limit)
+	if d, ok := e.store.(deadLister); ok {
+		return d.listDead(ctx, topic, limit)
+	}
+	return nil, fmt.Errorf("hourglass: store does not support dlq listing")
 }
 
 // replayDead requeues one dead row: attempts reset, due = now.
 func (e *engine) replayDead(ctx context.Context, id string) error {
+	r, ok := e.store.(interface {
+		replayDead(ctx context.Context, id string, now time.Time) error
+	})
+	if !ok {
+		return fmt.Errorf("hourglass: store does not support dlq replay")
+	}
 	now := e.clk.Now()
-	if err := e.store.(*sqliteStore).replayDead(ctx, id, now); err != nil {
+	if err := r.replayDead(ctx, id, now); err != nil {
 		return err
 	}
 	e.setQuietUntil(time.Time{})
@@ -614,14 +649,17 @@ func (e *engine) replayDead(ctx context.Context, id string) error {
 
 // replayAllDead requeues every dead row; returns the count.
 func (e *engine) replayAllDead(ctx context.Context) (int, error) {
-	ids, err := e.store.(*sqliteStore).listDeadIDs(ctx)
+	d, ok := e.store.(deadLister)
+	if !ok {
+		return 0, fmt.Errorf("hourglass: store does not support dlq listing")
+	}
+	ids, err := d.listDeadIDs(ctx)
 	if err != nil {
 		return 0, err
 	}
-	now := e.clk.Now()
 	n := 0
 	for _, id := range ids {
-		if err := e.store.(*sqliteStore).replayDead(ctx, id, now); err == nil {
+		if err := e.replayDead(ctx, id); err == nil {
 			n++
 		}
 	}
@@ -638,12 +676,22 @@ func (e *engine) TestStep(ctx context.Context) error { return e.step(ctx) }
 func (e *engine) TestPump(now time.Time) { e.pump(now) }
 
 // readCount exposes the store's read counter (benchmarks only).
-func (e *engine) readCount() int64 { return e.store.(*sqliteStore).readCount() }
+func (e *engine) readCount() int64 {
+	if c, ok := e.store.(interface{ readCount() int64 }); ok {
+		return c.readCount()
+	}
+	return 0
+}
 
 // sweep runs one retention pass: terminal rows past the TTL leave in
 // bounded batches. Never inline with the fire path.
 func (e *engine) sweep(ctx context.Context, now time.Time) (int, error) {
-	return e.store.(*sqliteStore).purgeTerminal(ctx, now, e.cfg.retention, maxSweepPerPass)
+	if p, ok := e.store.(interface {
+		purgeTerminal(ctx context.Context, now time.Time, ttl time.Duration, limit int) (int, error)
+	}); ok {
+		return p.purgeTerminal(ctx, now, e.cfg.retention, maxSweepPerPass)
+	}
+	return 0, nil
 }
 
 // Run drives admission and wheel ticks on a one-second cadence until

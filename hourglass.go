@@ -53,6 +53,9 @@ type Job struct {
 
 	Shard int // shard key (hash placement, computed once at submit)
 
+	// CreatedAt is the submit time (persisted; used by stores).
+	CreatedAt time.Time
+
 	CancelReason string // set when State == canceled
 }
 
