@@ -73,6 +73,10 @@ type engine struct {
 	// nothing admissible (quiescence watermark).
 	quietUntil time.Time
 
+	// exec: remote executor target (cluster execution face). nil in
+	// embedded handler mode.
+	exec *executorTarget
+
 	// dispatch delivers fired entries to handlers on a worker pool,
 	// outside the wheel lock: one slow handler must not stall ticks,
 	// admission, or cancel.
@@ -527,6 +531,22 @@ func (e *engine) fireEntry(task wheelTask) {
 	ctx := context.Background()
 	j := task.job
 	h := e.handlerFor(j.Topic)
+	e.mu.Lock()
+	ex := e.exec
+	e.mu.Unlock()
+	if ex != nil {
+		// remote execution face: push to the executor, ack by fired-id
+		rescheduleAt, err := e.deliver(j, j.ID)
+		if rescheduleAt > 0 && err == nil {
+			// self-chaining: complete this occurrence, requeue for the
+			// acked time once the flush has completed the row
+			e.rescheduleAfter(ctx, j, rescheduleAt)
+			task.res.complete(j.ID, nil)
+			return
+		}
+		task.res.complete(j.ID, err)
+		return
+	}
 	var herr error
 	if h == nil {
 		herr = fmt.Errorf("hourglass: no handler for topic %q", j.Topic)
@@ -534,6 +554,17 @@ func (e *engine) fireEntry(task wheelTask) {
 		herr = e.runHandler(ctx, h, j)
 	}
 	task.res.complete(j.ID, herr)
+}
+
+// rescheduleAfter requeues a fired job for an acked reschedule_at
+// (self-chaining): waits for the batch flush to land completed, then
+// flips it to waiting at the acked time.
+func (e *engine) rescheduleAfter(ctx context.Context, j Job, at int64) {
+	time.AfterFunc(300*time.Millisecond, func() {
+		if err := e.store.transition(ctx, j.ID, Completed, Waiting); err == nil {
+			_ = e.store.setDue(ctx, j.ID, time.Unix(at, 0).UTC())
+		}
+	})
 }
 
 // runHandler contains panics: a panicking handler is an error on that
@@ -736,5 +767,6 @@ func (e *engine) Close() error {
 	close(e.done)     // pump selects on this; Run's loop sees it via ctx or done
 	close(e.dispatch) // safe now: pump's only send path selects on done
 	e.wg.Wait()       // workers drain dispatch then exit
+	e.closeExecutor()
 	return e.wheel.Close()
 }
