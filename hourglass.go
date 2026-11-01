@@ -64,6 +64,22 @@ type Handle struct {
 
 // Open connects to a store named by dsn, e.g. "sqlite:///path/to/db".
 func Open(dsn string) (*Handle, error) {
+	return openWithClock(dsn, realClock{})
+}
+
+// Clock is the time seam; tests inject a deterministic clock.
+type Clock interface {
+	Now() time.Time
+}
+
+// OpenWithClock is Open with an injected clock (deterministic tests,
+// simulated time).
+func OpenWithClock(dsn string, clk Clock) (*Handle, error) {
+	return openWithClock(dsn, clk)
+}
+
+func openWithClock(dsn string, clk Clock) (*Handle, error) {
+	c := clock(clk)
 	switch {
 	case strings.HasPrefix(dsn, "sqlite://"):
 		path := strings.TrimPrefix(dsn, "sqlite://")
@@ -71,9 +87,8 @@ func Open(dsn string) (*Handle, error) {
 		if err != nil {
 			return nil, err
 		}
-		clk := realClock{}
-		eng := newEngine(store, clk, defaultEngineConfig())
-		return &Handle{db: store.db, store: store, eng: eng, clk: clk}, nil
+		eng := newEngine(store, c, defaultEngineConfig())
+		return &Handle{db: store.db, store: store, eng: eng, clk: c}, nil
 	default:
 		return nil, fmt.Errorf("hourglass: unsupported dsn %q (only sqlite:// supported)", dsn)
 	}
@@ -106,6 +121,10 @@ func (h *Handle) Cancel(ctx context.Context, id, reason string) error {
 func (h *Handle) Every(ctx context.Context, topic, spec string) (string, error) {
 	return h.eng.Every(ctx, topic, spec)
 }
+
+// Eng exposes the internal engine for package tests (CLI integration
+// drives admission deterministically). Not part of the stable API.
+func (h *Handle) Eng() *engine { return h.eng }
 
 // ErrEmptyTopic and ErrMissingDue are submit-time contract violations.
 var (

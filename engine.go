@@ -2,6 +2,7 @@ package hourglass
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -545,6 +546,76 @@ func (e *engine) transitionBatch(ctx context.Context, from, to State, ids []stri
 
 // stmtCount exposes the store's statement counter (tests only).
 func (e *engine) stmtCount() int64 { return e.store.(*sqliteStore).stmtCount() }
+
+// storeStats summarizes jobs by state for `hourglass stats`.
+func (e *engine) storeStats(ctx context.Context) *Stats {
+	rows, err := e.store.(*sqliteStore).db.QueryContext(ctx,
+		`SELECT state, COUNT(*) FROM jobs GROUP BY state ORDER BY state`)
+	if err != nil {
+		return &Stats{}
+	}
+	defer rows.Close()
+	st := &Stats{}
+	for rows.Next() {
+		var sc StateCount
+		var state string
+		if err := rows.Scan(&state, &sc.Count); err != nil {
+			return st
+		}
+		sc.State = State(state)
+		st.JobsByState = append(st.JobsByState, sc)
+		st.TotalJobs += sc.Count
+	}
+	_ = e.store.(*sqliteStore).db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM receipts`).Scan(&st.TotalReceipts)
+	var oldest sql.NullInt64
+	_ = e.store.(*sqliteStore).db.QueryRowContext(ctx,
+		`SELECT MIN(terminal_at) FROM jobs WHERE state IN ('completed','dead','canceled') AND terminal_at > 0`).Scan(&oldest)
+	if oldest.Valid && oldest.Int64 > 0 {
+		st.OldestTerminal = time.Unix(oldest.Int64, 0).UTC()
+	}
+	return st
+}
+
+// listDead lists dead rows newest-first for `hourglass dlq ls`.
+func (e *engine) listDead(ctx context.Context, topic string, limit int) ([]Job, error) {
+	return e.store.(*sqliteStore).listDead(ctx, topic, limit)
+}
+
+// replayDead requeues one dead row: attempts reset, due = now.
+func (e *engine) replayDead(ctx context.Context, id string) error {
+	now := e.clk.Now()
+	if err := e.store.(*sqliteStore).replayDead(ctx, id, now); err != nil {
+		return err
+	}
+	e.setQuietUntil(time.Time{})
+	return nil
+}
+
+// replayAllDead requeues every dead row; returns the count.
+func (e *engine) replayAllDead(ctx context.Context) (int, error) {
+	ids, err := e.store.(*sqliteStore).listDeadIDs(ctx)
+	if err != nil {
+		return 0, err
+	}
+	now := e.clk.Now()
+	n := 0
+	for _, id := range ids {
+		if err := e.store.(*sqliteStore).replayDead(ctx, id, now); err == nil {
+			n++
+		}
+	}
+	if n > 0 {
+		e.setQuietUntil(time.Time{})
+	}
+	return n, nil
+}
+
+// TestStep and TestPump expose the admission/fire loop to package tests
+// (CLI integration tests drive a real Handle deterministically).
+func (e *engine) TestStep(ctx context.Context) error { return e.step(ctx) }
+
+func (e *engine) TestPump(now time.Time) { e.pump(now) }
 
 // readCount exposes the store's read counter (benchmarks only).
 func (e *engine) readCount() int64 { return e.store.(*sqliteStore).readCount() }

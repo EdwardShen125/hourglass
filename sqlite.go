@@ -345,6 +345,64 @@ func (s *sqliteStore) attemptForRollback(ctx context.Context, ids []string) erro
 	return err
 }
 
+// listDead lists dead rows newest-first (by terminal_at desc), topic-
+// filtered, bounded.
+func (s *sqliteStore) listDead(ctx context.Context, topic string, limit int) ([]Job, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	var rows *sql.Rows
+	var err error
+	if topic != "" {
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT id, topic, payload, due, sched_at, state, cron, attempts, max_attempts, backoff, cancel_reason FROM jobs
+			 WHERE state='dead' AND topic = ? ORDER BY terminal_at DESC LIMIT ?`, topic, limit)
+	} else {
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT id, topic, payload, due, sched_at, state, cron, attempts, max_attempts, backoff, cancel_reason FROM jobs
+			 WHERE state='dead' ORDER BY terminal_at DESC LIMIT ?`, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanJobs(rows)
+}
+
+// listDeadIDs returns every dead row's id.
+func (s *sqliteStore) listDeadIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM jobs WHERE state='dead'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// replayDead flips one dead row back to waiting with attempts reset and
+// due=now — the DLQ replay edge. Errors when the row is not dead (raced
+// with another replay or a purge).
+func (s *sqliteStore) replayDead(ctx context.Context, id string, now time.Time) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE jobs SET state='waiting', attempts=0, due=?, terminal_at=0 WHERE id=? AND state='dead'`,
+		now.Unix(), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("hourglass: job %s is not dead", id)
+	}
+	return nil
+}
+
 // stmtCount exposes the statement counter (tests only).
 func (s *sqliteStore) listAll(ctx context.Context) ([]Job, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, topic, payload, due, sched_at, state, cron, attempts, max_attempts, backoff, cancel_reason FROM jobs`)
