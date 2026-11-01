@@ -33,9 +33,16 @@ func newMySQLStore(dsn string) (*mysqlStore, error) {
 	return s, nil
 }
 
+// partitionCount is the physical partition count of the jobs table.
+// MySQL HASH partitioning puts logical shard s in partition s % 32, so
+// the 256 logical shards over-partition 32 physical partitions: scan
+// pruning is per-partition, and a partition holds 8 logical shards
+// (the shard predicate stays in every query).
+const partitionCount = 32
+
 const mysqlSchema = `
 CREATE TABLE IF NOT EXISTS jobs (
-	id          VARCHAR(64) PRIMARY KEY,
+	id          VARCHAR(64) NOT NULL,
 	topic       VARCHAR(255) NOT NULL,
 	payload     BLOB,
 	due         BIGINT NOT NULL,
@@ -51,8 +58,10 @@ CREATE TABLE IF NOT EXISTS jobs (
 	terminal_at BIGINT NOT NULL DEFAULT 0,
 	cancel_reason TEXT NOT NULL,
 	created_at  BIGINT NOT NULL,
+	PRIMARY KEY (id, shard),
 	INDEX idx_jobs_due_state_shard (shard, state, due)
-);
+)
+PARTITION BY HASH (shard) PARTITIONS 32;
 CREATE TABLE IF NOT EXISTS receipts (
 	id       VARCHAR(64) PRIMARY KEY,
 	job_id   VARCHAR(64) NOT NULL,
@@ -485,6 +494,51 @@ func (s *mysqlStore) retryFor(ctx context.Context, id string, now time.Time, bac
 		`UPDATE jobs SET state='waiting', due=? WHERE id=? AND state='fired'`,
 		now.Add(backoff).Unix(), id)
 	return err
+}
+
+// purgeTerminal deletes terminal rows past ttl in bounded batches.
+// Partitioned-schema note (DESIGN retention): when a physical partition
+// is fully terminal it can be DROPped wholesale — a DDL instead of
+// batched DELETEs. Detection: SELECT partitions whose non-terminal rows
+// are all older than the retention floor. Not yet implemented: DROP
+// changes DDL ownership (needs a lock brief enough for online use);
+// tracked as the fast path once measured DELETE pressure justifies it.
+func (s *mysqlStore) purgeTerminal(ctx context.Context, now time.Time, ttl time.Duration, limit int) (int, error) {
+	cutoff := now.Add(-ttl).Unix()
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id FROM jobs WHERE state IN ('completed','dead','canceled') AND terminal_at > 0 AND terminal_at < ? LIMIT ?`,
+		cutoff, limit)
+	if err != nil {
+		return 0, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	ph := strings.Repeat("?,", len(ids))
+	ph = ph[:len(ph)-1]
+	args := make([]any, 0, len(ids))
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM receipts WHERE job_id IN (`+ph+`)`, args...); err != nil {
+		return 0, err
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM jobs WHERE id IN (`+ph+`)`, args...)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
 }
 
 func (s *mysqlStore) receipts(ctx context.Context, jobID string) ([]Receipt, error) {

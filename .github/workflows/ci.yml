@@ -96,7 +96,7 @@ jobs:
           done
           echo "services did not become ready"; exit 1
       - name: integration tests
-        run: go test -race -timeout 15m -run 'TestMySQL|TestRegistry|TestTwoNode|TestJoin|TestGraceful' -v ./...
+        run: go test -race -timeout 15m -run 'TestMySQL|TestRegistry|TestTwoNode|TestJoin|TestGraceful|TestPartition' -v ./...
 
   bench-gates:
     name: benchmark gates (precision, quiescence, hot minute)
