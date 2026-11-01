@@ -7,8 +7,30 @@ sharded cluster without changing the engine.
 h, _ := hourglass.Open("sqlite://./hourglass.db")
 defer h.Close()
 
+h.Register("email:welcome", handler)
 h.Submit(ctx, "email:welcome", payload, hourglass.Delay(24*time.Hour))
-h.Every(ctx, "report:daily", "0 9 * * *", handler)
+h.Every(ctx, "report:daily", "0 9 * * *")   // cron, registered handler
+h.Cancel(ctx, id, "user asked")             // wins until the fire moment
+
+go h.Run(ctx)                               // 1s ticks: admit -> wheel -> fire
+```
+
+Inspect and operate from the CLI (reads the same store):
+
+```
+$ hourglass stats
+jobs by state:
+  waiting    1204
+  completed  8891
+  dead       3
+receipts: 17802
+oldest terminal kept: 2d18h (ago)
+
+$ hourglass dlq ls --topic report:daily
+9f3c...  report:daily  attempts=3  due=2026-10-31T09:00:00Z
+
+$ hourglass dlq replay 9f3c...
+replayed 9f3c...
 ```
 
 No broker, no coordinator, no services to run. When the workload
@@ -40,6 +62,21 @@ and peaked above 200K execution commands per second — that story, and
 the failures that shaped it, is documented here:
 [Building a Production Go Scheduler for 200K+ Delayed Jobs per Second](https://edwardshen125.github.io/posts/engineering-case-study/building-a-production-go-scheduler-for-200k-delayed-jobs-per-second/).
 
+## Measured (v1.0 benchmarks, fake clock, in-repo and reproducible)
+
+| benchmark | hourglass | poll-based baseline |
+| --------- | --------- | ------------------- |
+| fire precision p50 / p99 / max (5,000 jobs / 10 min) | **0 / 0 / 1000 ms** (1s tick) | 2,000 / 4,000 / 5,000 ms (5s poll) |
+| quiescent reads, 10 min idle, 100K pending | **2** (admission watermark) | 121 (one scan per interval, forever) |
+| hot minute: 100K jobs due the same second | **11.1s drain, 0.02 write stmts/job, zero loss/duplication** | unbatched path would issue 4+ writes/job |
+
+All three are gated tests (`-run TestBenchmark`), not logged demos:
+regressing the wheel to poller-grade precision or losing the quiescence
+watermark fails the suite. The 100K hot minute found a real defect on
+its first run — every batched id-list statement exceeded SQLite's
+placeholder cap above ~8K ids and the batch silently stalled; all
+id-list statements now chunk at 500 per round-trip.
+
 ## Contracts
 
 - Jobs fire at the appointed second — never early, never skipped. The
@@ -57,24 +94,27 @@ the failures that shaped it, is documented here:
 
 ## Status
 
-Pre-1.0, private until launch-ready. Built to the enterprise bar
-(audit, fencing, HA handoff), entered through the 30-second start;
-the build blueprint is [DESIGN.md](DESIGN.md). v1.0 scope:
+Pre-1.0, private until launch-ready. The embedded engine is complete
+and measured (see above); cluster mode is the remaining v1.0 work. Built
+to the enterprise bar (audit, fencing, HA handoff), entered through the
+30-second start; the build blueprint is [DESIGN.md](DESIGN.md), the
+production lessons behind it are in [docs/lessons.md](docs/lessons.md).
+v1.0 scope:
 
-- [ ] Embedded core: SQLite storage, single-node admission loop
-- [ ] Hierarchical time wheel, second-level fire precision
-- [ ] Delayed jobs + cron, typed handler API
-- [ ] Dispersion (jitter) windows per schedule
-- [ ] Retention: terminal-row TTL, background purge, size metrics
-- [ ] Execution log: attempts, receipts, idempotency keys in core
-      schema
-- [ ] CLI: `stats`, `dlq ls`, `dlq replay`
+- [x] Embedded core: SQLite storage, single-node admission loop
+- [x] Hierarchical time wheel, second-level fire precision
+- [x] Delayed jobs + cron, typed handler API
+- [x] Dispersion (jitter) windows per schedule
+- [x] Retention: terminal-row TTL, background purge, size metrics
+- [x] Execution log: attempts, receipts in core schema
+- [x] Retry policy: per-job attempts, backoff requeue, dead letters
+- [x] Crash recovery: in-flight rows requeued at Open
+- [x] CLI: `stats`, `dlq ls`, `dlq replay`
+- [x] Benchmarks: fire precision, quiescence, hot minute (gated tests)
 - [ ] Cluster storage: MySQL/TiDB partitioned scans, CAS admission
 - [ ] Cluster coordination: etcd shard registry, epoch-fenced handoff,
       misfire rescan
 - [ ] Executor SDK (gRPC): registration, heartbeat, idempotency
-- [ ] Benchmarks: fire-time precision and throughput vs poll-based
-      schedulers
 
 Post-1.0, on demand: an MCP agent face (`hourglass mcp`, declarative
 webhook targets, self-chaining acks, event-anchored delays, debounce
