@@ -51,6 +51,8 @@ type Job struct {
 	MaxAttempts int           // 1 = no retries; exhausted -> dead
 	Backoff     time.Duration // delay before the next attempt
 
+	Shard int // shard key (hash placement, computed once at submit)
+
 	CancelReason string // set when State == canceled
 }
 

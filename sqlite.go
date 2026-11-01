@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 	topic    TEXT NOT NULL,
 	payload  BLOB,
 	due      INTEGER NOT NULL,          -- unix seconds (UTC)
+	shard    INTEGER NOT NULL DEFAULT 0, -- hash shard key
 	sched_at INTEGER NOT NULL DEFAULT 0, -- pre-jitter time (== due when no jitter)
 	state    TEXT NOT NULL DEFAULT 'waiting',
 	cron     TEXT NOT NULL DEFAULT '',
@@ -116,19 +117,19 @@ func (s *sqliteStore) Insert(ctx context.Context, j *Job) error {
 		j.ID = newID()
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO jobs (id, topic, payload, due, sched_at, state, cron, attempts, max_attempts, backoff, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		j.ID, j.Topic, j.Payload, j.Due.Unix(), j.ScheduledAt.Unix(), string(j.State), j.Cron, j.Attempts, j.MaxAttempts, int64(j.Backoff/time.Second), time.Now().Unix())
+		`INSERT INTO jobs (id, topic, payload, due, shard, sched_at, state, cron, attempts, max_attempts, backoff, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		j.ID, j.Topic, j.Payload, j.Due.Unix(), j.Shard, j.ScheduledAt.Unix(), string(j.State), j.Cron, j.Attempts, j.MaxAttempts, int64(j.Backoff/time.Second), time.Now().Unix())
 	return err
 }
 
 func (s *sqliteStore) Get(ctx context.Context, id string) (*Job, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, topic, payload, due, sched_at, state, cron, attempts, max_attempts, backoff, cancel_reason FROM jobs WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, topic, payload, due, shard, sched_at, state, cron, attempts, max_attempts, backoff, cancel_reason FROM jobs WHERE id = ?`, id)
 	var j Job
 	var state string
 	var due int64
 	var payload []byte
-	var sched, attempts, maxAttempts, backoff int64
-	if err := row.Scan(&j.ID, &j.Topic, &payload, &due, &sched, &state, &j.Cron, &attempts, &maxAttempts, &backoff, &j.CancelReason); err != nil {
+	var sched, attempts, maxAttempts, backoff, shard int64
+	if err := row.Scan(&j.ID, &j.Topic, &payload, &due, &shard, &sched, &state, &j.Cron, &attempts, &maxAttempts, &backoff, &j.CancelReason); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("hourglass: job %q not found", id)
 		}
@@ -136,6 +137,7 @@ func (s *sqliteStore) Get(ctx context.Context, id string) (*Job, error) {
 	}
 	j.Payload = payload
 	j.Due = time.Unix(due, 0).UTC()
+	j.Shard = int(shard)
 	if sched != 0 {
 		j.ScheduledAt = time.Unix(sched, 0).UTC()
 	}
@@ -147,10 +149,16 @@ func (s *sqliteStore) Get(ctx context.Context, id string) (*Job, error) {
 
 // Select implements Store: waiting jobs in [from, to] by due order.
 func (s *sqliteStore) Select(ctx context.Context, unit ScanUnit, from, to time.Time, n int) ([]Job, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, topic, payload, due, sched_at, state, cron, attempts, max_attempts, backoff, cancel_reason FROM jobs
-		 WHERE state = 'waiting' AND due >= ? AND due <= ?
-		 ORDER BY due ASC LIMIT ?`, from.Unix(), to.Unix(), n)
+	q := `SELECT id, topic, payload, due, shard, sched_at, state, cron, attempts, max_attempts, backoff, cancel_reason FROM jobs
+		 WHERE state = 'waiting' AND due >= ? AND due <= ?`
+	args := []any{from.Unix(), to.Unix()}
+	if unit != scanUnitAll {
+		q += ` AND shard = ?`
+		args = append(args, int(unit2shard(unit)))
+	}
+	q += ` ORDER BY due ASC LIMIT ?`
+	args = append(args, n)
+	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +190,7 @@ func (s *sqliteStore) Acquire(ctx context.Context, unit ScanUnit, epoch uint64, 
 		return nil, nil
 	}
 	var sb strings.Builder
-	sb.WriteString(`SELECT id, topic, payload, due, sched_at, state, cron, attempts, max_attempts, backoff, cancel_reason FROM jobs WHERE state = 'acquired' AND id IN (`)
+	sb.WriteString(`SELECT id, topic, payload, due, shard, sched_at, state, cron, attempts, max_attempts, backoff, cancel_reason FROM jobs WHERE state = 'acquired' AND id IN (`)
 	for i := range ids {
 		if i > 0 {
 			sb.WriteByte(',')
@@ -207,11 +215,12 @@ func scanJobs(rows *sql.Rows) ([]Job, error) {
 	for rows.Next() {
 		var j Job
 		var state string
-		var due, sched, attempts, maxAttempts, backoff int64
-		if err := rows.Scan(&j.ID, &j.Topic, &j.Payload, &due, &sched, &state, &j.Cron, &attempts, &maxAttempts, &backoff, &j.CancelReason); err != nil {
+		var due, sched, attempts, maxAttempts, backoff, shard int64
+		if err := rows.Scan(&j.ID, &j.Topic, &j.Payload, &due, &shard, &sched, &state, &j.Cron, &attempts, &maxAttempts, &backoff, &j.CancelReason); err != nil {
 			return nil, err
 		}
 		j.Due = time.Unix(due, 0).UTC()
+		j.Shard = int(shard)
 		if sched != 0 {
 			j.ScheduledAt = time.Unix(sched, 0).UTC()
 		}
@@ -414,11 +423,11 @@ func (s *sqliteStore) listDead(ctx context.Context, topic string, limit int) ([]
 	var err error
 	if topic != "" {
 		rows, err = s.db.QueryContext(ctx,
-			`SELECT id, topic, payload, due, sched_at, state, cron, attempts, max_attempts, backoff, cancel_reason FROM jobs
+			`SELECT id, topic, payload, due, shard, sched_at, state, cron, attempts, max_attempts, backoff, cancel_reason FROM jobs
 			 WHERE state='dead' AND topic = ? ORDER BY terminal_at DESC LIMIT ?`, topic, limit)
 	} else {
 		rows, err = s.db.QueryContext(ctx,
-			`SELECT id, topic, payload, due, sched_at, state, cron, attempts, max_attempts, backoff, cancel_reason FROM jobs
+			`SELECT id, topic, payload, due, shard, sched_at, state, cron, attempts, max_attempts, backoff, cancel_reason FROM jobs
 			 WHERE state='dead' ORDER BY terminal_at DESC LIMIT ?`, limit)
 	}
 	if err != nil {
@@ -464,7 +473,7 @@ func (s *sqliteStore) replayDead(ctx context.Context, id string, now time.Time) 
 
 // stmtCount exposes the statement counter (tests only).
 func (s *sqliteStore) listAll(ctx context.Context) ([]Job, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, topic, payload, due, sched_at, state, cron, attempts, max_attempts, backoff, cancel_reason FROM jobs`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, topic, payload, due, shard, sched_at, state, cron, attempts, max_attempts, backoff, cancel_reason FROM jobs`)
 	if err != nil {
 		return nil, err
 	}
@@ -483,7 +492,7 @@ func (s *sqliteStore) getMany(ctx context.Context, ids []string) (map[string]Job
 		}
 		part := ids[off:end]
 		ph := strings.Repeat("?,", len(part))
-		q := `SELECT id, topic, payload, due, sched_at, state, cron, attempts, max_attempts, backoff, cancel_reason FROM jobs WHERE id IN (` + ph[:len(ph)-1] + `)`
+		q := `SELECT id, topic, payload, due, shard, sched_at, state, cron, attempts, max_attempts, backoff, cancel_reason FROM jobs WHERE id IN (` + ph[:len(ph)-1] + `)`
 		args := make([]any, 0, len(part))
 		for _, id := range part {
 			args = append(args, id)
@@ -554,11 +563,17 @@ func (s *sqliteStore) purgeTerminal(ctx context.Context, now time.Time, ttl time
 
 func (s *sqliteStore) stmtCount() int64 { return s.db.stmts.Load() }
 
-// minPendingDue returns the earliest waiting due and whether any
-// exists. NULL (empty table) is not an error.
-func (s *sqliteStore) minPendingDue(ctx context.Context) (time.Time, bool, error) {
+// minPendingDueIn returns the earliest waiting due inside one scan
+// unit and whether any exists. NULL (empty) is not an error.
+func (s *sqliteStore) minPendingDueIn(ctx context.Context, unit ScanUnit) (time.Time, bool, error) {
 	var due sql.NullInt64
-	if err := s.db.QueryRowContext(ctx, `SELECT MIN(due) FROM jobs WHERE state='waiting'`).Scan(&due); err != nil {
+	var err error
+	if unit == scanUnitAll {
+		err = s.db.QueryRowContext(ctx, `SELECT MIN(due) FROM jobs WHERE state='waiting'`).Scan(&due)
+	} else {
+		err = s.db.QueryRowContext(ctx, `SELECT MIN(due) FROM jobs WHERE state='waiting' AND shard=?`, unit2shard(unit)).Scan(&due)
+	}
+	if err != nil {
 		return time.Time{}, false, err
 	}
 	if !due.Valid || due.Int64 == 0 {
@@ -569,6 +584,33 @@ func (s *sqliteStore) minPendingDue(ctx context.Context) (time.Time, bool, error
 
 // readCount exposes the read counter (quiescence benchmark).
 func (s *sqliteStore) readCount() int64 { return s.db.reads.Load() }
+
+// DefaultShards is the fixed logical shard count (Redis Cluster
+// precedent: fixed slot count written into the schema; scaling moves
+// ownership, never recomputes placement).
+const DefaultShards = 256
+
+// ShardFor computes the shard key for a job id (fnv-1a % DefaultShards).
+func ShardFor(id string) int {
+	h := uint32(2166136261)
+	for i := 0; i < len(id); i++ {
+		h ^= uint32(id[i])
+		h *= 16777619
+	}
+	return int(h % DefaultShards)
+}
+
+// unit2shard converts a ScanUnit back to its shard number.
+func unit2shard(u ScanUnit) int {
+	n := 0
+	for _, ch := range string(u) {
+		if ch < '0' || ch > '9' {
+			return -1
+		}
+		n = n*10 + int(ch-'0')
+	}
+	return n
+}
 
 func newID() string {
 	b := make([]byte, 16)

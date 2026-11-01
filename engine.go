@@ -55,12 +55,14 @@ func defaultEngineConfig() engineConfig {
 	}
 }
 
-// engine ties the store, the admission loop, and the wheel together for
-// embedded mode. One engine owns one scan unit.
+// engine ties the store, the admission loop, and the wheel together.
+// One engine owns exactly one scan unit (shard); a cluster runs one
+// engine per owned shard.
 type engine struct {
 	store    Store
 	clk      clock
 	cfg      engineConfig
+	unit     ScanUnit // scan unit this engine owns ("" = all, embedded)
 	wheel    *wheel
 	epoch    uint64
 	mu       sync.Mutex
@@ -80,6 +82,11 @@ type engine struct {
 }
 
 func newEngine(s Store, clk clock, cfg engineConfig) *engine {
+	return newEngineForShard(s, clk, cfg, scanUnitAll, 1)
+}
+
+// newEngineForShard binds an engine to one shard under the given epoch.
+func newEngineForShard(s Store, clk clock, cfg engineConfig, unit ScanUnit, epoch uint64) *engine {
 	if cfg.lookahead <= 0 {
 		cfg.lookahead = defaultEngineConfig().lookahead
 	}
@@ -99,7 +106,8 @@ func newEngine(s Store, clk clock, cfg engineConfig) *engine {
 		store:    s,
 		clk:      clk,
 		cfg:      cfg,
-		epoch:    1,
+		unit:     unit,
+		epoch:    epoch,
 		handlers: make(map[string]Handler),
 		dispatch: make(chan wheelTask, dispatchSizeOrDefault(cfg.dispatchSize)),
 		done:     make(chan struct{}),
@@ -143,6 +151,7 @@ func (e *engine) Submit(ctx context.Context, topic string, payload []byte, opts 
 	}
 	j := &Job{Topic: topic, Payload: payload, Due: c.due, ScheduledAt: c.due, State: Waiting,
 		Attempts: 0, MaxAttempts: max(c.maxAttempts, 1), Backoff: c.backoff}
+	j.Shard = ShardFor(j.ID)
 	if c.jitter > 0 {
 		j.Due = j.Due.Add(drawJitter(c.jitter, time.Now().UnixNano()))
 	}
@@ -241,7 +250,7 @@ func (e *engine) step(ctx context.Context) error {
 	from := now.Add(-e.cfg.misfireHalo)
 	to := now.Add(e.cfg.lookahead)
 
-	cands, err := e.store.Select(ctx, scanUnitAll, from, to, e.cfg.admitLimit)
+	cands, err := e.store.Select(ctx, e.unit, from, to, e.cfg.admitLimit)
 	if err != nil {
 		return fmt.Errorf("admission select: %w", err)
 	}
@@ -252,7 +261,7 @@ func (e *engine) step(ctx context.Context) error {
 		// crosses the lookahead while admission sleeps is still inside
 		// the scan floor when we wake — a job can never fall below the
 		// horizon and get lost (review finding #1).
-		minDue, ok, err := e.store.(*sqliteStore).minPendingDue(ctx)
+		minDue, ok, err := e.store.(*sqliteStore).minPendingDueIn(ctx, e.unit)
 		if err == nil && ok && minDue.After(now.Add(e.cfg.lookahead)) {
 			wake := minDue.Add(-e.cfg.lookahead)
 			if cap := now.Add(e.cfg.misfireHalo / 2); wake.After(cap) {
@@ -276,7 +285,7 @@ func (e *engine) step(ctx context.Context) error {
 		if end > len(ids) {
 			end = len(ids)
 		}
-		part, err := e.store.Acquire(ctx, scanUnitAll, e.epoch, ids[off:end])
+		part, err := e.store.Acquire(ctx, e.unit, e.epoch, ids[off:end])
 		if err != nil {
 			return fmt.Errorf("admission acquire: %w", err)
 		}
