@@ -201,18 +201,25 @@ futures — plus delayed-queue delivery backends (Pulsar, RocketMQ 5.x
 ```mermaid
 quadrantChart
     title where each system sits
-    x-axis "scheduling throughput is a constant" --> "scheduling scales with nodes"
-    y-axis "memory / cache is the truth" --> "SQL rows are the truth"
-    quadrant-1 "durable + scalable"
-    quadrant-2 "durable, single-plane"
-    quadrant-3 "cache-truth, single-plane"
-    quadrant-4 "cache-truth, scalable"
-    "asynq": [0.2, 0.28]
-    "river": [0.3, 0.6]
-    "xxl-job": [0.15, 0.5]
+    x-axis "scheduling plane is one process" --> "scheduling plane is the shard owners"
+    y-axis "opaque store (no SQL, no joins)" --> "queryable rows (join with domain tables)"
+    quadrant-1 "queryable + scales"
+    quadrant-2 "queryable, single-plane"
+    quadrant-3 "opaque, single-plane"
+    quadrant-4 "opaque, scales"
+    "asynq": [0.22, 0.2]
+    "river": [0.3, 0.78]
+    "xxl-job": [0.15, 0.7]
     "Temporal": [0.8, 0.9]
-    "hourglass": [0.8, 0.82]
+    "hourglass": [0.8, 0.85]
 ```
+
+Positions are qualitative judgments (two of seven dimensions — the
+table below carries the falsifiable rest). The interesting neighbor is
+river: near-identical truth model (full PG rows, transactional
+enqueue), and the entire difference is the x-axis — one elected leader
+advances scheduled jobs, versus one admission loop per shard owner.
+That, not storage, is where the designs diverge.
 
 What happens on the hot path when a job becomes due:
 
