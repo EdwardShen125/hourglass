@@ -201,8 +201,8 @@ futures — plus delayed-queue delivery backends (Pulsar, RocketMQ 5.x
 ```mermaid
 quadrantChart
     title where each system sits
-    x-axis "scheduling plane is one process" --> "scheduling plane is the shard owners"
-    y-axis "opaque store (no SQL, no joins)" --> "queryable rows (join with domain tables)"
+    x-axis "one scheduling process" --> "scheduling per shard owner"
+    y-axis "opaque store" --> "queryable rows"
     quadrant-1 "queryable + scales"
     quadrant-2 "queryable, single-plane"
     quadrant-3 "opaque, single-plane"
