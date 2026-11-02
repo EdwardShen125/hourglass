@@ -94,13 +94,16 @@ func TestMySQLAcquiredAtDrivesReclaim(t *testing.T) {
 
 	j := &Job{Topic: "t", Due: base, State: Waiting, Shard: 5}
 	s.Insert(ctx, j)
-	if _, err := s.Acquire(ctx, ScanUnit("5"), 7, []string{j.ID}); err != nil {
+	if _, err := s.Acquire(ctx, ScanUnit("5"), 8, []string{j.ID}); err != nil {
 		t.Fatal(err)
 	}
 
-	// fresh acquisition: not reclaimable
+	// fresh acquisition under the CURRENT owner's epoch: not reclaimable.
+	// (An epoch LOWER than the reclaim epoch means ownership changed —
+	// that row is stale by fencing and IS reclaimed; see the failover
+	// e2e. Same-epoch fresh rows must survive.)
 	if n, err := s.Reclaim(ctx, ScanUnit("5"), 8, time.Minute); err != nil || n != 0 {
-		t.Fatalf("reclaim of fresh row: n=%d err=%v, want 0", n, err)
+		t.Fatalf("reclaim of fresh same-epoch row: n=%d err=%v, want 0", n, err)
 	}
 
 	// age the row past the TTL, then a new epoch reclaims it

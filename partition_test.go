@@ -63,7 +63,10 @@ func TestPartitionedSchemaAndPruning(t *testing.T) {
 		t.Fatalf("jobs has %d partitions, want %d", parts, partitionCount)
 	}
 
-	// EXPLAIN: a shard-scoped scan must prune to ONE partition
+	// EXPLAIN: a shard-scoped scan must prune to ONE partition.
+	// Column count varies by MySQL version (8 in 5.7, 12 in 8.x with
+	// rows/filtered/extra trailing), so scan dynamically: the partitions
+	// column is index 3 in every variant.
 	for shard := 0; shard < DefaultShards; shard += 37 { // sample shards 0,37,74,...221
 		rows, err := s.db.QueryContext(ctx,
 			`EXPLAIN SELECT id FROM jobs WHERE state='waiting' AND due >= ? AND due <= ? AND shard = ?`,
@@ -71,20 +74,39 @@ func TestPartitionedSchemaAndPruning(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer rows.Close()
-		var partitions string
+		cols, _ := rows.Columns()
+		partIdx := -1
+		for i, c := range cols {
+			if c == "partitions" {
+				partIdx = i
+			}
+		}
+		if partIdx < 0 {
+			rows.Close()
+			t.Fatalf("EXPLAIN has no partitions column: %v", cols)
+		}
 		scanned := false
+		var partitions string
 		for rows.Next() {
-			var id, sel, tbl, part, nRows, rRows, filtered, extra string
-			var nRowsN, rRowsN interface{}
-			_ = nRowsN
-			_ = rRowsN
-			if err := rows.Scan(&id, &sel, &tbl, &part, &nRows, &rRows, &filtered, &extra); err != nil {
-				// EXPLAIN may return 8 or 12 columns depending on version
-				continue
+			vals := make([]any, len(cols))
+			ptrs := make([]any, len(cols))
+			for i := range vals {
+				ptrs[i] = &vals[i]
+			}
+			if err := rows.Scan(ptrs...); err != nil {
+				rows.Close()
+				t.Fatalf("EXPLAIN scan: %v", err)
 			}
 			scanned = true
-			partitions = part
+			if b, ok := vals[partIdx].([]byte); ok {
+				partitions = string(b)
+			} else if str, ok := vals[partIdx].(string); ok {
+				partitions = str
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
 		}
 		if !scanned {
 			t.Fatalf("EXPLAIN returned no rows for shard %d", shard)
