@@ -144,7 +144,10 @@ embedded engine and cluster mode, both exercised by gated integration
 tests against real MySQL and etcd (see above). Built
 to the enterprise bar (audit, fencing, HA handoff), entered through the
 30-second start; the build blueprint is [DESIGN.md](DESIGN.md), the
-production lessons behind it are in [docs/lessons.md](docs/lessons.md).
+decision records with rejected alternatives are in
+[docs/decisions.md](docs/decisions.md), the positioning self-critique
+is in [docs/positioning.md](docs/positioning.md), and the production
+lessons behind it are in [docs/lessons.md](docs/lessons.md).
 v1.0 scope:
 
 - [x] Embedded core: SQLite storage, single-node admission loop
@@ -161,6 +164,26 @@ v1.0 scope:
 - [x] Cluster coordination: etcd shard registry, epoch-fenced handoff,
       misfire rescan
 - [x] Executor SDK (gRPC): registration, heartbeat, idempotency
+
+## Where the hard parts are
+
+For a reviewer with 30 minutes — each row is a correctness mechanism,
+where it lives, and the test that proves it:
+
+| Mechanism | Code | Proven by |
+| --- | --- | --- |
+| Epoch fencing: a zombie node cannot fire after handoff | `wheel.go` `SetEpoch`, `engine.go` batch epoch check on CAS + fire path | `TestWheelEpochFencingBlocksZombie`, `TestEpochFencingEndToEnd`, `TestTwoNodeShardFailoverEndToEnd` |
+| Cancel is mark-don't-remove: no removal race with the tick | `wheel.go` `Cancel` + tick skip | `TestWheelCancelIsMarkNotRemove`, `TestCancelDuringPumpReReadWindow` |
+| Misfire horizon: wheel is lossy by design, rescan covers it | `engine.go` `misfireHalo` window floor | `TestOpenRecoversInFlightRows`, failover ×3 in [docs/loadtest-report.md](docs/loadtest-report.md) |
+| Wheel overflow releases surplus to `waiting` (backpressure, not OOM) | `engine.go` admit capacity + release | `TestWheelRejectsWhenFull`, `TestWheelOverflowReleaseEndToEnd`, `TestBenchmarkHotMinute` (100K jobs due the same second) |
+| Batched fire-path writes: one statement per tick per target state | `engine.go` pump (`~32K` id cap for MySQL packet limits) | `TestBenchmarkHotMinute` drain curve; 6,346 fires/s, zero loss |
+| Never early, never skipped | `wheel.go` tick semantics | `TestWheelNeverFiresEarly`, `TestWheelFiresAtAppointedSecond` |
+| Ownership loss arrives as a watch event, not a discovery poll | `registry.go` claim/lease/watch, `ForceEpochBump` | `TestRegistryLeaseExpiryFreesShard`, `TestRegistryWatchDeliversOwnershipLoss` |
+| Graceful handoff drains one per-shard wheel, no surgery on shared state | `join.go` | `TestJoinClaimsShardsAndFiresJobs`, `TestGracefulHandoffMovesShardWithoutLoss` |
+
+The reasoning behind each mechanism — including what was rejected —
+is in [docs/decisions.md](docs/decisions.md).
+
 
 ```mermaid
 flowchart TB
@@ -196,6 +219,12 @@ webhook targets, self-chaining acks, event-anchored delays, debounce
 windows) — durable time for agents that cannot hold their own
 futures — plus delayed-queue delivery backends (Pulsar, RocketMQ 5.x
 `deliver-at`) for deployments that already run a broker.
+
+**Scope note (2026-11):** the v1.x agent-face roadmap above is
+shelved. The category claim behind it did not survive its own
+challenge round — see [docs/positioning.md](docs/positioning.md).
+Scope is frozen at v1.0; investment goes to measurement rigor and the
+judgment artifacts, not feature breadth.
 
 ## Comparison
 
