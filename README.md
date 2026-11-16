@@ -139,8 +139,9 @@ id-list statements now chunk at 500 per round-trip.
 
 ## Status
 
-Pre-1.0, private until launch-ready. The embedded engine is complete
-and measured (see above); cluster mode is the remaining v1.0 work. Built
+Pre-1.0, private until launch-ready. The v1.0 scope is complete:
+embedded engine and cluster mode, both exercised by gated integration
+tests against real MySQL and etcd (see above). Built
 to the enterprise bar (audit, fencing, HA handoff), entered through the
 30-second start; the build blueprint is [DESIGN.md](DESIGN.md), the
 production lessons behind it are in [docs/lessons.md](docs/lessons.md).
@@ -156,10 +157,10 @@ v1.0 scope:
 - [x] Crash recovery: in-flight rows requeued at Open
 - [x] CLI: `stats`, `dlq ls`, `dlq replay`
 - [x] Benchmarks: fire precision, quiescence, hot minute (gated tests)
-- [ ] Cluster storage: MySQL/TiDB partitioned scans, CAS admission
-- [ ] Cluster coordination: etcd shard registry, epoch-fenced handoff,
+- [x] Cluster storage: MySQL/TiDB partitioned scans, CAS admission
+- [x] Cluster coordination: etcd shard registry, epoch-fenced handoff,
       misfire rescan
-- [ ] Executor SDK (gRPC): registration, heartbeat, idempotency
+- [x] Executor SDK (gRPC): registration, heartbeat, idempotency
 
 ```mermaid
 flowchart TB
