@@ -1,7 +1,7 @@
 # hourglass
 
-Delayed jobs and cron for Go: start in 30 seconds on SQLite, scale to a
-sharded cluster without changing the engine.
+Delayed jobs and cron for Go: SQLite embedded, sharded MySQL/TiDB +
+etcd cluster — same engine, same API.
 
 ```go
 h, _ := hourglass.Open("sqlite://./hourglass.db")
@@ -15,29 +15,17 @@ h.Cancel(ctx, id, "user asked")             // wins until the fire moment
 go h.Run(ctx)                               // 1s ticks: admit -> wheel -> fire
 ```
 
-Operate from the CLI, reading the same store: `hourglass stats`,
-`hourglass dlq ls`, `hourglass dlq replay`.
+CLI reads the same store: `hourglass stats`, `hourglass dlq ls`,
+`hourglass dlq replay`.
 
-No broker, no coordinator, no services to run. When the workload
-outgrows one process, point the same code at MySQL and add etcd — the
-engine, the data model, and the API stay identical.
+## Design
 
-## How it works
-
-Poll-based schedulers define precision as a polling interval: to fire
-closer to the appointed second, they query the database more often,
-across all pending jobs, forever. hourglass splits the timing contract:
-
-- **The database keeps the long horizon.** A job due in two days is a
-  quiet row — auditable, cancelable, recoverable in SQL. Nothing looks
-  at it until its window approaches.
-- **The wheel keeps the precision.** A lookahead window is admitted in
-  CAS batches and held in an in-process hierarchical time wheel that
-  fires at the appointed second. The database is quiescent between
-  admission windows.
-- **The state machine keeps the honesty.** Admission is a CAS; delivery
-  is at-least-once with idempotent handlers; dead letters are rows;
-  cancellations persist as receipts until retention.
+Precision is not a polling interval. The database holds the long
+horizon — a job due in two days is a quiet row until its window
+approaches. The wheel holds the precision — a lookahead window admitted
+in CAS batches, fired from memory at the second; zero DB reads between
+admission windows. Admission is CAS, delivery is at-least-once with
+idempotent handlers, dead letters and cancellations are rows.
 
 ```mermaid
 flowchart LR
@@ -54,27 +42,22 @@ flowchart LR
     acquired → waiting (wheel overflow, crash recovery, lease reclaim)
     completed → waiting (cron next occurrence) · dead → waiting (dlq replay)
 
-Cluster mode is the same engine per shard: MySQL/TiDB partitioned
-scans, nodes leasing logical shards (over-allocated, mapped to
-partitions by a directory) through etcd with epoch-fenced handoff.
-Adding a node claims free shards — no leader, no data movement;
-scheduling throughput grows with nodes.
+Cluster: one engine per shard over MySQL/TiDB partitioned scans. Nodes
+lease logical shards (over-allocated, directory-mapped onto partitions)
+from etcd, epoch-fenced handoff. Adding a node claims free shards — no
+leader, no data movement.
 
 ## Contracts
 
-- Jobs fire at the appointed second — never early, never skipped.
-  Memory is a cache; the database is the owner.
-- Jobs never orphan. A crashed node's in-flight jobs are reclaimed by
-  lease expiry and re-fired within the misfire horizon.
-- Cancellation actually cancels, until the fire moment; epoch fencing
-  stops a zombie node's late shots from resurrecting a canceled job.
-- Every fire is a queryable receipt. "Did this side effect happen?"
-  is a SELECT in every deployment shape.
+- Fire at the appointed second, never early, never skipped. Memory is
+  a cache; the database is the owner.
+- No orphans: a crashed node's in-flight jobs are reclaimed by lease
+  expiry and re-fired within the misfire horizon.
+- Cancel wins until the fire moment; epoch fencing stops a zombie
+  node's late shots.
+- Every fire is a receipt — "did this side effect happen?" is a SELECT.
 
-## Where the hard parts are
-
-Each row is a correctness mechanism, where it lives, and the test that
-proves it:
+## Hard parts
 
 | Mechanism | Code | Proven by |
 | --- | --- | --- |
@@ -84,27 +67,25 @@ proves it:
 | Wheel overflow releases surplus to `waiting` (backpressure, not OOM) | `engine.go` admit capacity + release | `TestWheelRejectsWhenFull`, `TestWheelOverflowReleaseEndToEnd` |
 | Batched fire-path writes: one statement per tick per target state | `engine.go` pump (~32K id cap for MySQL packets) | `TestBenchmarkHotMinute` |
 | Never early, never skipped | `wheel.go` tick semantics | `TestWheelNeverFiresEarly`, `TestWheelFiresAtAppointedSecond` |
-| Ownership loss arrives as a watch event, not a discovery poll | `registry.go` claim/lease/watch | `TestRegistryLeaseExpiryFreesShard`, `TestRegistryWatchDeliversOwnershipLoss` |
+| Ownership loss is a watch event, not a discovery poll | `registry.go` claim/lease/watch | `TestRegistryLeaseExpiryFreesShard`, `TestRegistryWatchDeliversOwnershipLoss` |
 | Graceful handoff drains one per-shard wheel | `join.go` | `TestJoinClaimsShardsAndFiresJobs`, `TestGracefulHandoffMovesShardWithoutLoss` |
 
 ## Decisions
 
-The choices where a reasonable engineer would plausibly have taken the
-other path — and why this one:
+Only the choices whose alternative a competent engineer would defend:
 
-| Decision | The tempting alternative, rejected |
+| Decision | Rejected |
 | --- | --- |
 | DB keeps the long horizon; the wheel keeps the precision | shorter polling — precision bought with permanent DB load over all pending jobs |
-| The wheel is the core; a broker is a post-1.0 delivery sink | broker-first — uncancellable after publish, the delayed index lives on the broker's heap, three systems before the first job fires |
-| Fencing authority is etcd epochs | DB-row fencing (Temporal's shape) — couples ownership truth to every store dialect; etcd leases deliver ownership loss as a watch event, not a discovery poll |
-| Cancel of an admitted-but-unfired job is mark-don't-remove | remove-under-lock — races the tick, and a slow cancel path stalls the fire path |
-| `fired_record` rows are the durable queue; memory is a cache | in-memory push with retry — a slow executor stalls the wheel, and a crash between fire and delivery orphans the job |
-| Admission is capacity-bounded; overflow is released back to `waiting` | unbounded wheel — the lookahead window is a memory budget, and without release it becomes an OOM instead of backpressure |
+| The wheel is the core; a broker is a post-1.0 delivery sink | broker-first — uncancellable after publish, delayed index on the broker's heap, three systems before the first job fires |
+| Fencing authority is etcd epochs | DB-row fencing (Temporal's shape) — couples ownership to every store dialect; etcd leases deliver loss as a watch event |
+| Cancel of an admitted-but-unfired job is mark-don't-remove | remove-under-lock — races the tick, and a slow cancel stalls the fire path |
+| `fired_record` rows are the durable queue; memory is a cache | in-memory push with retry — a slow executor stalls the wheel; a crash between fire and delivery orphans the job |
+| Admission is capacity-bounded; overflow releases back to `waiting` | unbounded wheel — the lookahead is a memory budget; without release it is an OOM, not backpressure |
 
 ## Measured
 
-Gated tests (`-run TestBenchmark`, fake clock, reproducible in CI) —
-regressing these fails the suite:
+Gated tests (`-run TestBenchmark`, fake clock) — regressions fail CI:
 
 | benchmark | hourglass | poll-based baseline |
 | --------- | --------- | ------------------- |
@@ -112,8 +93,8 @@ regressing these fails the suite:
 | quiescent reads, 10 min idle, 100K pending | **2** (watermark) | 121 (one scan per interval, forever) |
 | hot minute: 100K jobs due the same second | **11.1s drain, 0.02 write stmts/job, zero loss** | unbatched path: 4+ writes/job |
 
-Cluster load, real MySQL 8.4 + etcd 3.5.17 on one laptop (shape, not
-fleet grade), `cmd/hourglass-bench`:
+Cluster load, real MySQL 8.4 + etcd 3.5.17, one laptop
+(`cmd/hourglass-bench`):
 
 | jobs | shards | submit/s | fires/s | loss |
 | ---- | ------ | -------- | ------- | ---- |
@@ -122,60 +103,52 @@ fleet grade), `cmd/hourglass-bench`:
 | 50,000 | 32 | 3,699 | 5,553 | 0 |
 | 100,000 | 32 | 4,061 | **6,346** | 0 |
 
-Failover (hard kill, 2,000 in-flight jobs, 3 runs): lease-expiry
-takeover 2.57–3.58s (LeaseTTL-bound), 2,000/2,000 re-fired by the new
-owner, zero loss, zero duplication.
+Failover (hard kill, 2,000 in-flight jobs, 3 runs): takeover 2.57–3.58s
+(LeaseTTL-bound), 2,000/2,000 re-fired by the new owner, zero loss,
+zero duplication.
 
-Submit→fire latency and the drain curve from a measured run (HDR
-histogram, per-job source-anchored — no coordinated omission from the
-measuring side):
+Latency and drain curve from a measured run (HDR, per-job
+source-anchored — no coordinated omission from the measuring side):
 
 <img src="docs/charts/latency-percentiles.svg" width="760" alt="submit→fire latency percentiles">
 
 <img src="docs/charts/fire-curve.svg" width="760" alt="fires per second, drain curve">
 
-**Defects the tests caught** — each invisible to the unit suite, each
-surfaced by a gated benchmark or a load run against real infra:
+Defects caught by the bench suite, none visible to unit tests:
 
-1. The 100K hot minute stalled silently: batched id-list statements
-   exceeded SQLite's ~8K placeholder cap. All id-list statements now
-   chunk at 500 per round-trip.
-2. Reclaim was age-only: a takeover right after a crash reclaimed
-   nothing. Fix: `epoch < newEpoch` OR aged lease.
+1. Hot minute stalled silently: batched id-list statements exceeded
+   SQLite's ~8K placeholder cap → chunk at 500 per round-trip.
+2. Reclaim was age-only: takeover right after a crash reclaimed
+   nothing → `epoch < newEpoch` OR aged lease.
 3. Engines spawned after `Register` started handlerless: reclaimed
-   jobs dead-lettered 2,000/2,000. Fix: engines inherit the registry.
-4. `KillForTest` only killed the lease, simulating a zombie that
-   happened to be correct. Fix: hard kill stops engines without drain
-   — the honest simulation, which exposed (2) and (3) in minutes.
+   jobs dead-lettered 2,000/2,000 → engines inherit the registry.
+4. `KillForTest` killed only the lease, simulating a zombie that
+   happened to be correct → hard kill without drain, which exposed
+   (2) and (3) in minutes.
 
-Reading the numbers honestly: the ~6.3K fires/s cap is a
-single-process ceiling with default knobs; the 200K/s ancestor number
-is not comparable (its hot path was broker delivery, not per-fire SQL
-receipts — the honest trade for SQL-auditable execution).
-
-Protocol:
+The ~6.3K fires/s is a single-process ceiling at default knobs; the
+200K/s ancestor ran broker delivery, not per-fire SQL receipts — not
+comparable.
 
 ```sh
 # engine benchmarks, anywhere (SQLite):
 go test -run '^$' -bench 'Benchmark(Submit|FirePath)' -count 10 > old.txt
-benchstat old.txt new.txt                          # statistical comparison
+benchstat old.txt new.txt
 
 # cluster scenarios (real MySQL + etcd):
 hourglass-bench -s cluster-throughput -n 20000 -shards 16
-benchplot -mode percentile -o latency.svg bench-results/*.json   # SVG chart
+benchplot -mode percentile -o latency.svg bench-results/*.json
 ```
 
-## Honest limits
+## Limits
 
-- The "standalone durable time layer" category claim is unproven; this
-  is a reference implementation with an honest measurement story, not a
-  category founder. Scope is frozen at v1.0 (a v1.x agent-face roadmap
-  was considered and shelved).
-- Every ownership change is a precision cliff: takeover is
-  LeaseTTL-bound (2.57–3.58s measured at TTL=3s; 15–20s at a
-  production default of 15s). No loss — but latency during handover.
-- Benchmark numbers are single-host, laptop-grade.
-- 256 logical shards, fixed; rebalance is manual in v1.0.
+- The "standalone durable time layer" category is unproven; this is a
+  reference implementation, not a category founder. Scope frozen at
+  v1.0.
+- Takeover is LeaseTTL-bound: 2.57–3.58s at TTL=3s, 15–20s at 15s. No
+  loss — but every ownership change is a latency window.
+- All numbers single-host, laptop-grade.
+- 256 logical shards, fixed; rebalance is manual.
 
 ## Compared
 
@@ -189,13 +162,11 @@ benchplot -mode percentile -o latency.svg bench-results/*.json   # SVG chart
 | cancel       | until claimed  | while running (cooperative) | manual | workflow-level | until fire moment (epoch-fenced) |
 | dependency   | Redis          | PostgreSQL       | DB + central   | 4 services + DB  | the SQL you run    |
 
-The interesting neighbor is river: near-identical truth model, and the
-entire difference is the scheduling plane — one elected leader versus
-one admission loop per shard owner. Temporal runs the same
-shard-owner + fencing-generation model (its RangeID is our epoch;
-verified in source) carrying a workflow engine on top — durable
-execution is the product; a durable timer shouldn't need it. Compose
-them when you need replay.
+river is the interesting neighbor: same truth model, the difference is
+entirely the scheduling plane — elected leader vs admission loop per
+shard owner. Temporal runs the same shard-owner + fencing-generation
+model (RangeID ≈ epoch, verified in source) with a workflow engine on
+top; a durable timer shouldn't need one. Compose when you need replay.
 
 ## Not goals
 
@@ -206,12 +177,11 @@ proven.
 
 ## Status
 
-v1.0 complete and frozen: embedded engine, cluster mode (MySQL/TiDB +
-etcd), gRPC executor face; CI covers lint, race, real-infra
-integration, and the benchmark gates. Clean-room rebuild from a
-production system that replaced xxl-job and peaked above 200K
-execution commands per second —
-[the write-up](https://edwardshen125.github.io/posts/engineering-case-study/building-a-production-go-scheduler-for-200k-delayed-jobs-per-second/).
+v1.0 complete, frozen: embedded engine, cluster (MySQL/TiDB + etcd),
+gRPC executor. CI: lint, race, real-infra integration, benchmark
+gates. Clean-room rebuild from a production system that peaked above
+200K execution commands per second —
+[write-up](https://edwardshen125.github.io/posts/engineering-case-study/building-a-production-go-scheduler-for-200k-delayed-jobs-per-second/).
 
 ## License
 
