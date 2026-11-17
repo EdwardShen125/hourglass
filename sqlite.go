@@ -514,7 +514,7 @@ func (s *sqliteStore) getMany(ctx context.Context, ids []string) (map[string]Job
 }
 
 // maxSweepPerPass bounds one retention pass: bounded batches, never a
-// giant DELETE (never inline with the fire path — README, Decisions).
+// giant DELETE (never inline with the fire path — README, Contracts).
 const maxSweepPerPass = 500
 
 // purgeTerminal deletes up to limit terminal rows older than ttl and
