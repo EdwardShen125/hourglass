@@ -53,8 +53,36 @@ Output, per scenario:
    format; concatenate runs and diff with benchstat as in Tier 1.
 3. **JSON artifact** — `bench-results/<scenario>-<timestamp>.json`
    with the full HDR histogram export (re-quantile later at any
-   percentile), the scalar percentiles, rates, and environment.
-   Artifacts are local; `bench-results/` is gitignored.
+   percentile), the scalar percentiles, the per-second fire curve,
+   rates, and environment. Artifacts are local; `bench-results/` is
+   gitignored.
+
+## Charts
+
+`cmd/benchplot` renders deterministic SVG charts from artifacts
+(flags before file arguments — Go's flag package stops at the first
+positional arg):
+
+```sh
+go build -o benchplot ./cmd/benchplot
+benchplot -mode percentile -o docs/charts/latency.svg bench-results/*.json
+benchplot -mode fire       -o docs/charts/fire.svg   bench-results/*.json
+```
+
+- `percentile` — submit→fire latency curve (p50→max) per artifact,
+  one series each: tail shape at a glance.
+- `fire` — per-second fire counts, zero-padded past the last fire so
+  the drain visibly completes.
+
+Committed examples (generated from the 2026-11-17 cluster-throughput
+run, n=5000, shards=8, MySQL 8.4 + etcd 3.5.17 on one laptop):
+
+<img src="charts/latency-percentiles.svg" width="760" alt="submit→fire latency percentiles">
+
+<img src="charts/fire-curve.svg" width="760" alt="fires per second, drain curve">
+
+Charts are regenerated, never hand-edited; the artifact is the source
+of truth and the SVG is a pure function of it.
 
 ## Why HDR and source-anchored latency
 

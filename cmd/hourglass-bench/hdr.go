@@ -22,11 +22,14 @@ type latTracker struct {
 	submitted sync.Map // job id -> time.Time
 	mu        sync.Mutex
 	h         *hdrhistogram.Histogram
+	t0        time.Time
+	fires     []int // per-second fire counts since t0
 }
 
 func newLatTracker() *latTracker {
 	return &latTracker{
-		h: hdrhistogram.New(1, int64(time.Hour/time.Millisecond), 2),
+		h:  hdrhistogram.New(1, int64(time.Hour/time.Millisecond), 2),
+		t0: time.Now(),
 	}
 }
 
@@ -45,7 +48,21 @@ func (t *latTracker) markFired(id string, at time.Time) {
 	}
 	t.mu.Lock()
 	_ = t.h.RecordValue(ms)
+	if sec := int(at.Sub(t.t0) / time.Second); sec < 3600 {
+		for len(t.fires) <= sec {
+			t.fires = append(t.fires, 0)
+		}
+		t.fires[sec]++
+	}
 	t.mu.Unlock()
+}
+
+// fireCurve returns per-second fire counts (index = seconds since the
+// tracker started) for the drain-shape chart.
+func (t *latTracker) fireCurve() []int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]int{}, t.fires...)
 }
 
 var benchPercentiles = []float64{50, 90, 99, 99.9, 99.99}
@@ -114,6 +131,8 @@ func (t *latTracker) writeArtifact(scenario string, extra map[string]any) (strin
 		"cpus":        runtime.NumCPU(),
 		"hdr_unit":    "ms",
 		"hdr":         hdrExport,
+		"max_ms":      t.h.Max(),
+		"fire_curve":  t.fireCurve(),
 		"percentiles": map[string]int64{},
 	}
 	for _, p := range benchPercentiles {
