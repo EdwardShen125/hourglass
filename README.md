@@ -21,31 +21,62 @@ CLI reads the same store: `hourglass stats`, `hourglass dlq ls`,
 ## Design
 
 Precision is not a polling interval. The database holds the long
-horizon — a job due in two days is a quiet row until its window
-approaches. The wheel holds the precision — a lookahead window admitted
-in CAS batches, fired from memory at the second; zero DB reads between
-admission windows. Admission is CAS, delivery is at-least-once with
-idempotent handlers, dead letters and cancellations are rows.
+horizon — a job due in two days is a quiet row. The wheel holds the
+precision — a lookahead window admitted in CAS batches, fired from
+memory at the second, zero DB reads between admission windows.
+
+Fire path:
 
 ```mermaid
-flowchart LR
-    S("Submit / Cancel / Get") --> DB[("jobs + receipts — every state is a row")]
-    DB -- "window enters lookahead" --> AL["admission loop: scan + CAS batch, epoch-stamped"]
-    AL --> TW["hierarchical wheel: fire at the second"]
-    TW --> WP["worker pool / gRPC executor"]
-    WP -- "complete / dead / retry receipts" --> DB
-    DB -. "quiescence watermark: quiet store = zero scans" .- AL
+flowchart TD
+    S["Submit / Cancel / Get"] -->|"INSERT waiting"| R[("job row<br/>state · due · shard · epoch")]
+    R -->|"due enters lookahead"| AL["admission loop<br/>scan + CAS batch"]
+    AL -->|"waiting → acquired<br/>epoch stamped"| W["hierarchical wheel<br/>fires at the second"]
+    W -->|"due reached"| WP["worker pool<br/>gRPC executor"]
+    WP -->|"complete / dead / retry"| RT[("receipts + dead letters<br/>queryable rows")]
+    R -.->|"cancel wins<br/>until fire moment"| RT
+    RT -.->|"quiescence watermark:<br/>quiet store = zero scans"| AL
 ```
 
-    waiting → acquired (CAS, epoch on the row) → fired → completed | dead
-    waiting | acquired → canceled (cancel wins until the fire moment)
-    acquired → waiting (wheel overflow, crash recovery, lease reclaim)
-    completed → waiting (cron next occurrence) · dead → waiting (dlq replay)
+Job states (terminal rows persist as receipts until retention):
 
-Cluster: one engine per shard over MySQL/TiDB partitioned scans. Nodes
-lease logical shards (over-allocated, directory-mapped onto partitions)
-from etcd, epoch-fenced handoff. Adding a node claims free shards — no
-leader, no data movement.
+```mermaid
+stateDiagram-v2
+    [*] --> waiting: submit
+    waiting --> acquired: CAS admission (epoch)
+    acquired --> fired: wheel fires
+    fired --> completed: handler ok
+    fired --> dead: retries exhausted
+    fired --> waiting: retry backoff / reschedule_at
+    waiting --> canceled: cancel
+    acquired --> canceled: cancel until fire moment
+    acquired --> waiting: overflow · recovery · reclaim
+    completed --> waiting: cron next occurrence
+    dead --> waiting: dlq replay
+```
+
+Cluster — ownership, not a leader:
+
+```mermaid
+flowchart TB
+    ETCD["etcd<br/>shard leases + epoch generations"]
+    DB[("MySQL / TiDB<br/>jobs + receipts, partitioned")]
+    NA["node-a<br/>engines: shards 0–31"]
+    NB["node-b<br/>engines: shards 32–255"]
+    NC["node-c<br/>joins → claims free shards"]
+
+    NA -.->|"claim · keepalive · epoch bump"| ETCD
+    ETCD -.->|"watch: ownership loss"| NB
+    NC -.->|"claim"| ETCD
+    NA --> DB
+    NB --> DB
+    NC --> DB
+```
+
+Shards are logical and over-allocated, mapped onto partitions by a
+directory — adding a node claims free shards, no data moves. Handoff
+is graceful (drain the wheel, release) or lease-expiry (new owner
+bumps the epoch, reclaims acquired rows, rescans the misfire horizon).
 
 ## Contracts
 
