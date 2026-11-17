@@ -89,22 +89,17 @@ proves it:
 
 ## Decisions
 
-What was chosen, and what was rejected instead:
+The choices where a reasonable engineer would plausibly have taken the
+other path — and why this one:
 
-| # | Decision | Rejected |
-| --- | --- | --- |
-| D1 | DB keeps the long horizon; the wheel keeps the precision | shorter polling — precision bought with permanent DB load |
-| D2 | The wheel is the core; a broker is a post-1.0 delivery sink | broker-first — uncancellable after publish, broker-heap memory, three systems before the first job fires |
-| D3 | Embedded-first; cluster is the same engine | cluster-only (kills the 30-second start); two engines (every guarantee proven twice) |
-| D4 | Fencing authority is etcd epochs | DB-row fencing — couples ownership to every store dialect; etcd leases deliver loss as a watch event |
-| D5 | Cancel is mark-don't-remove | remove-under-lock — a slow cancel stalls the fire path |
-| D6 | `fired_record` rows are the durable queue; memory is a cache | synchronous push (a slow executor stalls the wheel); a broker queue (D2's funnel in the hot path) |
-| D7 | Admission is capacity-bounded; overflow is released, never dropped | unbounded wheel — the memory budget becomes a crash |
-| D8 | Fire-path writes are batched, ~32K ids per statement | per-job writes — the write storm the ancestor paid for in production |
-| D9 | Logical shards over-allocated, mapped to partitions by a directory | fixed shard = partition count — Temporal's shards freeze at boot; the real asymmetry is lifetime + remapping |
-| D10 | Cancellations persist as receipts | delete-on-cancel — silently rewriting history |
-| D11 | Jitter is drawn once at submit and stored | randomized at fire — same dispersion, no auditability |
-| D12 | Scope fences: no DAG, no exactly-once, no replay, no NL time, never calls a model | each has a tempting PR; each couples the timer to a state model or provider that belongs to another layer |
+| Decision | The tempting alternative, rejected |
+| --- | --- |
+| DB keeps the long horizon; the wheel keeps the precision | shorter polling — precision bought with permanent DB load over all pending jobs |
+| The wheel is the core; a broker is a post-1.0 delivery sink | broker-first — uncancellable after publish, the delayed index lives on the broker's heap, three systems before the first job fires |
+| Fencing authority is etcd epochs | DB-row fencing (Temporal's shape) — couples ownership truth to every store dialect; etcd leases deliver ownership loss as a watch event, not a discovery poll |
+| Cancel of an admitted-but-unfired job is mark-don't-remove | remove-under-lock — races the tick, and a slow cancel path stalls the fire path |
+| `fired_record` rows are the durable queue; memory is a cache | in-memory push with retry — a slow executor stalls the wheel, and a crash between fire and delivery orphans the job |
+| Admission is capacity-bounded; overflow is released back to `waiting` | unbounded wheel — the lookahead window is a memory budget, and without release it becomes an OOM instead of backpressure |
 
 ## Measured
 
