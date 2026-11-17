@@ -32,7 +32,7 @@ type wheelEntry struct {
 // the buckets actually passed — O(1) amortized per tick. Entries due
 // beyond their level's horizon cascade down as time advances.
 //
-// Correctness machinery (DESIGN.md "four load-bearing pieces"):
+// Correctness machinery (README "Where the hard parts are"):
 //   - Epoch validation happens on the fire path, per batch: an entry
 //     admitted under a revoked epoch is dropped, not delivered.
 //   - Cancel is mark-don't-remove: racing the tick with a removal risks

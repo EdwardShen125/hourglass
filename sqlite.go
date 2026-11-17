@@ -35,7 +35,7 @@ func newSQLiteStore(path string) (*sqliteStore, error) {
 
 // recover requeues in-flight rows left by a crashed process: acquired
 // and fired flip back to waiting, so the next admission re-fires them
-// (at-least-once; DESIGN.md "jobs never orphan"). Terminal rows
+// (at-least-once; README "Contracts"). Terminal rows
 // (completed/dead/canceled) are receipts and stay untouched.
 //
 // Embedded mode owns the whole store, so "another live engine holds
@@ -292,7 +292,7 @@ func (s *sqliteStore) reschedule(ctx context.Context, id string, next time.Time)
 	return err
 }
 
-// legalEdges is the DESIGN.md state machine: every allowed transition.
+// legalEdges is the README state machine: every allowed transition.
 var legalEdges = map[[2]State]bool{
 	{Waiting, Acquired}:  true, // CAS admission
 	{Acquired, Fired}:    true, // wheel fired, handler dispatched
@@ -514,7 +514,7 @@ func (s *sqliteStore) getMany(ctx context.Context, ids []string) (map[string]Job
 }
 
 // maxSweepPerPass bounds one retention pass: bounded batches, never a
-// giant DELETE (DESIGN.md: never inline with the fire path).
+// giant DELETE (never inline with the fire path — README, Decisions).
 const maxSweepPerPass = 500
 
 // purgeTerminal deletes up to limit terminal rows older than ttl and

@@ -8,7 +8,7 @@ import (
 
 // Receipt is one durable execution-log row: every state transition of
 // interest is a row the user can SELECT. "Did this side effect happen?"
-// is a query on every deployment shape (DESIGN.md).
+// is a query on every deployment shape (README: Contracts).
 type Receipt struct {
 	ID      string
 	JobID   string

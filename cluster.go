@@ -13,7 +13,7 @@ import (
 // independently (share-nothing between shards).
 //
 // Ownership (which process holds which shards) is the registry's job
-// (etcd leases + epoch fencing, DESIGN.md "Shard registry"); Cluster is
+// (etcd leases + epoch fencing — README, "How it works"); Cluster is
 // the per-process executor of whatever ownership it is handed.
 type Cluster struct {
 	store    Store

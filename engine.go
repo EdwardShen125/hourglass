@@ -15,7 +15,7 @@ type Handler func(ctx context.Context, j Job) error
 
 // engineConfig bounds the admission loop. The lookahead window is a
 // memory budget: wheel memory ≈ admission rate × lookahead × bytes per
-// timer (DESIGN.md).
+// timer (README).
 type engineConfig struct {
 	lookahead    time.Duration
 	admitLimit   int

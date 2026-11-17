@@ -1,6 +1,6 @@
 // Package hourglass provides delayed jobs and cron for Go: durable truth
 // in SQL, second-level fire precision from an in-process hierarchical time
-// wheel. See DESIGN.md for the timing contract.
+// wheel. See README ("How it works") for the timing contract.
 package hourglass
 
 import (
@@ -161,7 +161,7 @@ func Delay(d time.Duration) SubmitOption {
 }
 
 // Jitter disperses the due time by rand(0, w), drawn once at submit and
-// stored: hot minutes melt before they form (DESIGN.md). Default zero.
+// stored: hot minutes melt before they form (README). Default zero.
 func Jitter(w time.Duration) SubmitOption {
 	return func(c *submitConfig) { c.jitter = w }
 }

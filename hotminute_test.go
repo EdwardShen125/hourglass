@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// BenchHotMinute (DESIGN.md benchmark 2): N jobs due at the same second.
+// BenchHotMinute (README, Measured): N jobs due at the same second.
 // Measures: time to drain, statements issued (write pressure on the
 // database), and that nothing is lost or duplicated.
 //

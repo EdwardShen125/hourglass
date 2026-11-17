@@ -9,7 +9,7 @@ import (
 
 // Crash recovery: a process that died with rows in acquired/fired must
 // have them requeued to waiting at next Open — at-least-once re-fire
-// (DESIGN.md: "a crashed node's in-flight jobs are reclaimed ... and
+// (README Contracts: "a crashed node's in-flight jobs are reclaimed ... and
 // re-fired within the misfire horizon").
 func TestOpenRecoversInFlightRows(t *testing.T) {
 	ctx := context.Background()

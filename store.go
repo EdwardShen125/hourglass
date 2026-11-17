@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// Store is the persistence seam from DESIGN.md: the database keeps the
+// Store is the persistence seam: the database keeps the
 // long horizon. SQLite implements one scan unit (embedded); MySQL/TiDB
 // implement shard-scoped scans plus lease reclaim (cluster).
 type Store interface {
