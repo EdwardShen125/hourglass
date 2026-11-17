@@ -146,8 +146,9 @@ to the enterprise bar (audit, fencing, HA handoff), entered through the
 30-second start; the build blueprint is [DESIGN.md](DESIGN.md), the
 decision records with rejected alternatives are in
 [docs/decisions.md](docs/decisions.md), the positioning self-critique
-is in [docs/positioning.md](docs/positioning.md), and the production
-lessons behind it are in [docs/lessons.md](docs/lessons.md).
+is in [docs/positioning.md](docs/positioning.md), the measurement
+protocol is in [docs/measurement.md](docs/measurement.md), and the
+production lessons behind it are in [docs/lessons.md](docs/lessons.md).
 v1.0 scope:
 
 - [x] Embedded core: SQLite storage, single-node admission loop

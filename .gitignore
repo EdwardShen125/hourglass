@@ -12,6 +12,9 @@ dist/
 *.out
 coverage.html
 
+# Bench artifacts (docs/measurement.md)
+bench-results/
+
 # Dependency directories
 vendor/
 

@@ -96,8 +96,13 @@ func clusterThroughput(ctx context.Context, dsn, etcd string, n, shardN, workerN
 		}
 	}
 
+	// HDR latency: each job's submit timestamp is anchored at Submit
+	// and closed at fire, so the delta is per-job source-anchored.
+	lat := newLatTracker()
+
 	var delivered atomic.Int64
-	node.Register("bench", func(context.Context, hourglass.Job) error {
+	node.Register("bench", func(_ context.Context, j hourglass.Job) error {
+		lat.markFired(j.ID, time.Now())
 		delivered.Add(1)
 		return nil
 	})
@@ -112,12 +117,14 @@ func clusterThroughput(ctx context.Context, dsn, etcd string, n, shardN, workerN
 		go func(w int) {
 			defer wg.Done()
 			for i := 0; i < per; i++ {
-				if _, err := node.Submit(ctx, "bench", nil,
+				id, err := node.Submit(ctx, "bench", nil,
 					hourglass.At(time.Now().UTC().Add(time.Duration(i%5000)*time.Millisecond+2*time.Second)),
-					hourglass.InShard((w*per+i)%shardN)); err != nil {
+					hourglass.InShard((w*per+i)%shardN))
+				if err != nil {
 					errCh <- err
 					return
 				}
+				lat.markSubmit(id, time.Now())
 			}
 		}(w)
 	}
@@ -139,11 +146,30 @@ func clusterThroughput(ctx context.Context, dsn, etcd string, n, shardN, workerN
 	drainDur := time.Since(fireStart)
 	stop()
 
-	emit(result{Name: fmt.Sprintf("cluster-throughput n=%d shards=%d", n, shardN), Fields: [][2]string{
+	fields := [][2]string{
 		{"submit", fmt.Sprintf("%d jobs in %s = %.0f/s", n, submitDur, float64(n)/submitDur.Seconds())},
 		{"drain", fmt.Sprintf("%d fired in %s = %.0f fires/s", delivered.Load(), drainDur, float64(delivered.Load())/drainDur.Seconds())},
 		{"delivered", fmt.Sprintf("%d/%d (loss=%.2f%%)", delivered.Load(), n, 100*float64(n-int(delivered.Load()))/float64(n))},
-	}})
+	}
+	fields = append(fields, lat.hdrFields("submit→fire ")...)
+	emit(result{Name: fmt.Sprintf("cluster-throughput n=%d shards=%d", n, shardN), Fields: fields})
+
+	// benchstat-consumable lines (throughput pair); percentiles above.
+	for _, line := range lat.benchstatLines("ClusterThroughput", n, submitDur, drainDur, delivered.Load()) {
+		fmt.Println(line)
+	}
+
+	artifact, err := lat.writeArtifact("cluster-throughput", map[string]any{
+		"jobs": n, "shards": shardN, "workers": workerN,
+		"submit_per_sec": float64(n) / submitDur.Seconds(),
+		"fire_per_sec":   float64(delivered.Load()) / drainDur.Seconds(),
+		"loss_pct":       100 * float64(n-int(delivered.Load())) / float64(n),
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "artifact: %v\n", err)
+	} else {
+		fmt.Printf("artifact: %s\n", artifact)
+	}
 }
 
 // scenario 3: kill the owner mid-storm; measure recovery.
