@@ -29,7 +29,7 @@ Fire path:
 
 ```mermaid
 flowchart TD
-    S["Submit / Cancel / Get"] -->|"INSERT waiting"| R[("job row<br/>state · due · shard · epoch")]
+    S["Submit"] -->|"INSERT waiting"| R[("job row<br/>state · due · shard · epoch")]
     R -->|"due enters lookahead"| AL["admission loop<br/>scan + CAS batch"]
     AL -->|"waiting → acquired<br/>epoch stamped"| W["hierarchical wheel<br/>fires at the second"]
     W -->|"due reached"| WP["worker pool<br/>gRPC executor"]
