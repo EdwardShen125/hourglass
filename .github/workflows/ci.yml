@@ -61,16 +61,6 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
-      etcd:
-        image: gcr.io/etcd-development/etcd:v3.5.17
-        ports:
-          - 2379:2379
-        options: >-
-          --entrypoint etcd
-          --health-cmd "etcdctl --endpoints=http://127.0.0.1:2379 endpoint health"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
     env:
       TEST_MYSQL_DSN: root:hgtest@tcp(127.0.0.1:3306)/hourglass
       TEST_ETCD_ADDR: http://127.0.0.1:2379
@@ -82,6 +72,10 @@ jobs:
           cache: true
       - name: wait for services
         run: |
+          # The release image has no shell, so a service health check (CMD-SHELL)
+          # never passes, and it listens on loopback only. Run it by hand on 0.0.0.0.
+          docker run -d --name etcd -p 2379:2379 gcr.io/etcd-development/etcd:v3.5.17 \
+            etcd --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://127.0.0.1:2379
           for i in $(seq 1 30); do
             mysql_ready=0; etcd_ready=0
             if command -v mysql >/dev/null 2>&1; then
